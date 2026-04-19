@@ -81,64 +81,74 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        wait = WebDriverWait(driver, 25)
+        wait = WebDriverWait(driver, 30)
         
-        # Function to find and enter text into an element across frames
-        def find_and_type(selectors, value, click_after=None):
-            for _ in range(2): # Try twice (once in current frame, once after resetting)
+        def find_and_type(selectors, value, click_after_selectors=None):
+            for _ in range(3): # Try multiple times for iframe detection
                 for selector in selectors:
                     try:
                         el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                        el.click() # Focus first
+                        time.sleep(0.5)
                         el.clear()
-                        el.send_keys(value)
-                        if click_after:
-                            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, click_after)))
-                            btn.click()
+                        # Simulate typing
+                        for char in value:
+                            el.send_keys(char)
+                        
+                        if click_after_selectors:
+                            btn = None
+                            for b_sel in click_after_selectors:
+                                try:
+                                    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, b_sel)))
+                                    break
+                                except: continue
+                            if btn:
+                                btn.click()
                         return True
                     except:
                         continue
-                # If not found, try switching to the first iframe
+                
+                # Check for iframes if not found
                 driver.switch_to.default_content()
-                if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                if len(iframes) > 0:
                     driver.switch_to.frame(0)
+                time.sleep(1)
             return False
 
         # STEP 1: Email
-        time.sleep(5)
+        time.sleep(6)
         email_selectors = ["#signInFormUsername", "input[name='username']", "input[type='email']"]
-        next_selectors = ["button[type='submit']", "input[name='signInSubmitButton']", ".submit-button"]
+        button_selectors = ["button[type='submit']", "input[name='signInSubmitButton']", ".submit-button", "button.btn-primary"]
         
-        if not find_and_type(email_selectors, email, click_after=next_selectors[0]):
-            st.error("Could not find Email field. Page structure might have changed.")
+        if not find_and_type(email_selectors, email, click_after_selectors=button_selectors):
+            st.error("Failed to enter Email.")
             return None
 
         # STEP 2: Password
-        # Significant wait for Cognito state transition
-        time.sleep(4)
+        # Cognito transition can be slow
+        time.sleep(5)
         pass_selectors = ["#signInFormPassword", "input[name='password']", "input[type='password']"]
         
-        if not find_and_type(pass_selectors, password, click_after=next_selectors[0]):
-            st.error("Could not find Password field after clicking Next.")
+        if not find_and_type(pass_selectors, password, click_after_selectors=button_selectors):
+            st.error("Failed to enter Password.")
             return None
         
-        # STEP 3: Wait for redirect and capture cookies
-        time.sleep(12)
+        # STEP 3: Wait for landing
+        time.sleep(15)
         
-        captured = False
         for _ in range(5):
             cookies = driver.get_cookies()
-            # Look for ANY cookies, Cognito ones are usually long strings
             if cookies and len(cookies) > 2:
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
-                captured = True
-                break
-            time.sleep(2)
+                return sess
+            time.sleep(3)
             
-        return sess if captured else None
+        return None
         
     except Exception as e:
-        st.error(f"Automation Error: {str(e)}")
+        st.error(f"Automation Critical Error: {str(e)}")
         return None
     finally:
         if driver:
@@ -195,10 +205,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in... this takes about 40 seconds."):
+                    with st.spinner("Executing secure login flow..."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication failed. Check logs or try again.")
+                        else: st.error("Login failed. Check your password or try again.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
