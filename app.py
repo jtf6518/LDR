@@ -90,7 +90,6 @@ def authenticate_headless(email, password):
         driver.get(f"{BASE}/volunteer/#/login")
         time.sleep(3)
         
-        # Perform Login steps
         wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']"))).send_keys(email)
         wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')]"))).click()
         
@@ -98,18 +97,16 @@ def authenticate_headless(email, password):
         wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']"))).send_keys(password)
         wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in')]"))).click()
         
-        # CRITICAL: Wait for the dashboard to successfully load before grabbing session data
         try:
             wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'My Shifts') or contains(text(), 'Welcome')]")))
-            time.sleep(2) # Give a short buffer for the browser to write to localStorage
+            time.sleep(2) 
         except:
-            raise Exception("Timeout waiting for dashboard to load. Incorrect password or blocked by CAPTCHA.")
+            raise Exception("Timeout waiting for dashboard to load.")
             
         sess = requests.Session()
         for c in driver.get_cookies(): 
             sess.cookies.set(c['name'], c['value'])
             
-        # Extract AWS Amplify Bearer token from localStorage
         token = driver.execute_script("""
             for (let i = 0; i < localStorage.length; i++) {
                 let key = localStorage.key(i);
@@ -128,7 +125,6 @@ def authenticate_headless(email, password):
         if driver: driver.quit()
 
 def safe_get_json(auth_dict, url, params=None):
-    """Safely fetch JSON and report explicit API errors."""
     sess = auth_dict['sess']
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -150,45 +146,58 @@ def safe_get_json(auth_dict, url, params=None):
 def get_dashboard_data(_auth_dict, target_date_obj):
     if not _auth_dict: return None, None
     
-    # 1. Fetch data safely
-    s_raw = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", {"includeShiftRoles": "true"})
-    if isinstance(s_raw, str): return s_raw, None # Passes error string back to UI
+    # 1. Fetch data - Added extra params to grab past shifts and up to 500 records
+    shifts_params = {"includeShiftRoles": "true", "includeShiftUsers": "true", "take": 500, "includePast": "true"}
+    s_raw = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", shifts_params)
+    
+    if isinstance(s_raw, str): return s_raw, None 
     if not s_raw: return "ERR_EMPTY", None
     
     shift_defs = {s['id']: s for s in s_raw}
     
-    enrollments = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments")
+    enrollments = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments", {"take": 500})
     if isinstance(enrollments, str): enrollments = []
     
-    attendance = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance")
+    attendance = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance", {"take": 500})
     if isinstance(attendance, str): attendance = []
     
     raw_people = []
     uids = set()
     seen_keys = set()
     
-    # 2. Extract uniquely identified people with assignments
+    # 2. Extract people (Safely falls back if the shift is missing from the API)
     def process_person(item):
-        uid = item.get('userId')
-        sid = item.get('eventShiftId')
+        uid = item.get('userId') or item.get('id')
+        sid = item.get('eventShiftId') or item.get('shiftId')
         if not uid or not sid: return
         
         s_def = shift_defs.get(sid)
-        if not s_def: return
         
-        s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+        # If the API drops the shift because it's in the past, reconstruct it from the attendance record
+        if s_def:
+            s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            s_end = datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            
+            rid = item.get('eventRoleId')
+            r_name = "Volunteer"
+            for r in s_def.get('roles', []):
+                if r.get('id') == rid:
+                    r_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                    break
+        else:
+            start_raw = item.get('shiftStartDate') or item.get('startDate') or item.get('startTimestamp')
+            end_raw = item.get('shiftEndDate') or item.get('endDate') or item.get('endTimestamp')
+            
+            if not start_raw: return # Can't place on board without any time data
+            
+            s_start = datetime.fromisoformat(start_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            s_end = datetime.fromisoformat(end_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if end_raw else s_start + timedelta(hours=1)
+            r_name = item.get('eventRoleName') or item.get('roleName') or "Volunteer"
+
         if s_start.date() != target_date_obj: return
         
         key = f"{sid}-{uid}"
         if key in seen_keys: return
-        
-        # Find Role Name
-        rid = item.get('eventRoleId')
-        r_name = "Volunteer"
-        for r in s_def.get('roles', []):
-            if r.get('id') == rid:
-                r_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
-                break
         
         raw_people.append({
             'uid': uid, 'sid': sid, 
@@ -196,7 +205,7 @@ def get_dashboard_data(_auth_dict, target_date_obj):
             'lname': item.get('lastName', '').strip(), 
             'role': r_name,
             'start': s_start, 
-            'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            'end': s_end
         })
         uids.add(uid)
         seen_keys.add(key)
@@ -208,7 +217,7 @@ def get_dashboard_data(_auth_dict, target_date_obj):
             for user in role.get('users', []):
                 process_person({'userId': user.get('id'), 'eventShiftId': sid, 'firstName': user.get('firstName'), 'lastName': user.get('lastName'), 'eventRoleId': role.get('id')})
 
-    # 3. Enrichment (Fetch Profiles & Punches)
+    # 3. Enrichment
     punch_map = {}
     profile_map = {}
 
@@ -227,15 +236,13 @@ def get_dashboard_data(_auth_dict, target_date_obj):
             punch_map[uid] = p_list
             profile_map[uid] = prof
 
-    # 4. Filter & Clean
+    # 4. Final Cleanup
     final_roster = []
     for p in raw_people:
         prof = profile_map.get(p['uid'], {})
         fname = p['fname'] if p['fname'] else prof.get('firstName', '')
         lname = p['lname'] if p['lname'] else prof.get('lastName', '')
         
-        # If the name is STILL completely missing, label them "Unknown" instead of dropping them
-        # so you can actually see that a shift exists and was pulled
         if not fname or fname.lower() in ["none", "volunteer"]: 
             fname = "Unknown"
             lname = f"(ID: {p['uid']})"
@@ -265,9 +272,9 @@ with st.sidebar:
 
 if st.session_state.auth_data:
     now = datetime.now(LOCAL_TZ)
-    c1, c2 = st.columns([3, 1])
-    with c2: t_date = st.date_input("Board Date", value=now.date())
-    with c1: st.title(f"Roster: {t_date.strftime('%A, %b %d')}")
+    t_date = now.date()
+    
+    st.title(f"Refuge Roster — {t_date.strftime('%A, %b %d')}")
     
     with st.spinner("Syncing Bloomerang..."):
         data = get_dashboard_data(st.session_state.auth_data, t_date)
@@ -278,7 +285,7 @@ if st.session_state.auth_data:
                 st.error("Session Expired. Please log in again.")
                 st.stop()
             else:
-                st.error(f"Bloomerang API Connection Error: {data[0]}")
+                st.error(f"API Error: {data[0]}")
                 st.stop()
                 
         roster, punches = data
@@ -298,7 +305,7 @@ if st.session_state.auth_data:
 
             cin = datetime.fromisoformat(my_punch['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('startTimestamp') else None
             cout = datetime.fromisoformat(my_punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('endTimestamp') else None
-            p_str = f"In: {cin.strftime('%I:%M%p') if cin else '--'} → Out: {cout.strftime('%I:%M%p') if cout else '--'}"
+            p_str = f"In: {cin.strftime('%I:%M %p') if cin else '--'} → Out: {cout.strftime('%I:%M %p') if cout else '--'}"
             
             status, css = "Scheduled", "status-pending"
             if cin and cout: status, css = "Completed", "status-completed"
