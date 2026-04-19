@@ -15,6 +15,7 @@ try:
     from webdriver_manager.chrome import ChromeDriverManager
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException
 except ImportError as e:
     st.error(f"Missing Dependencies: {e}. Please ensure requirements.txt exists in your GitHub root.")
     st.stop()
@@ -80,59 +81,57 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        # Longer initial wait for Bloomerang to load the Cognito container
-        wait = WebDriverWait(driver, 30)
-        time.sleep(7) 
+        wait = WebDriverWait(driver, 20)
+        time.sleep(5) 
 
-        # Step 1: Email Screen
-        # Cognito often uses a single iframe for the whole login widget
+        # Iframe Handling
         if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
             driver.switch_to.frame(0)
             
-        # Target Cognito Username field
-        email_field = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[name='username'], #username, input[type='email']")))
+        # STEP 1: Email
+        # Using multi-selector approach for robustness
+        email_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='username'], #username, input[type='email']")))
         email_field.clear()
         email_field.send_keys(email)
         
-        # Find and click Next/Submit
-        next_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button")))
+        next_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button, button.btn-primary")))
         next_btn.click()
         
-        # Step 2: Password Screen
-        # Wait for transition - don't use sleep alone, wait for the element to actually exist
-        time.sleep(3) 
-        pass_field = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
+        # STEP 2: Password
+        # We wait for the password field to appear. 
+        # Sometimes Cognito transitions within the same frame, sometimes it reloads.
+        time.sleep(3)
+        try:
+            # Re-check frame if element is not found immediately
+            pass_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
+        except TimeoutException:
+            # Try switching back to main and checking frames again
+            driver.switch_to.default_content()
+            if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+                driver.switch_to.frame(0)
+            pass_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
+
         pass_field.clear()
         pass_field.send_keys(password)
         
-        # Final Login click
-        login_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button")))
+        login_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button, button.btn-primary")))
         login_btn.click()
         
-        # Step 3: Wait for landing page and cookies
-        # Cognito redirects can be slow on headless
-        time.sleep(12)
+        # STEP 3: Capturing Session
+        time.sleep(10)
         
-        # Check if login was successful by looking for any cookie that implies a session
         for _ in range(5):
             cookies = driver.get_cookies()
-            if any(c['name'].startswith('CognitoIdentity') or 'session' in c['name'].lower() or 'token' in c['name'].lower() for c in cookies):
+            if cookies and any('cognito' in c['name'].lower() or 'session' in c['name'].lower() for c in cookies):
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
                 return sess
-            time.sleep(3)
-            
-        # Last effort capture
-        cookies = driver.get_cookies()
-        if cookies:
-            for cookie in cookies:
-                sess.cookies.set(cookie['name'], cookie['value'])
-            return sess
+            time.sleep(2)
             
         return None
         
     except Exception as e:
-        st.error(f"Login failed during automation: {str(e)}")
+        st.error(f"Login Automation Error: {str(e)}")
         return None
     finally:
         if driver:
@@ -145,12 +144,10 @@ def get_dashboard_data(_sess):
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*'
         }
         r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         
-        if r.status_code != 200: 
-            return None, None
+        if r.status_code != 200: return None, None
         
         shifts = r.json()
         now_local = datetime.now(LOCAL_TZ)
@@ -179,7 +176,7 @@ def get_dashboard_data(_sess):
                 service_map[uid] = data
         return todays_shifts, service_map
     except Exception as e:
-        st.error(f"Data Fetch Error: {e}")
+        st.error(f"Data API Error: {e}")
         return None, None
 
 # ─── App UI ───
@@ -191,10 +188,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Processing multi-step login..."):
+                    with st.spinner("Logging in to Bloomerang..."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication failed. Please verify credentials or try again.")
+                        else: st.error("Authentication failed. Check your password or try again.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
@@ -210,7 +207,7 @@ if st.session_state.get('sess'):
     now = datetime.now(LOCAL_TZ)
     st.title(f"Refuge Roster — {now.strftime('%A, %b %d')}")
     
-    with st.spinner("Updating board..."):
+    with st.spinner("Fetching today's schedule..."):
         shifts, svc_data = get_dashboard_data(st.session_state.sess)
     
     if shifts:
@@ -252,7 +249,7 @@ if st.session_state.get('sess'):
         else:
             st.info("No more shifts scheduled for today.")
     elif shifts is None:
-        st.warning("Session may have expired. Please log in again.")
+        st.warning("Session may have expired. Please log in again via the sidebar.")
                 
     time.sleep(60)
     st.rerun()
