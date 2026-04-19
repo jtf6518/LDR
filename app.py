@@ -80,48 +80,59 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
+        # Longer initial wait for Bloomerang to load the Cognito container
         wait = WebDriverWait(driver, 30)
-        time.sleep(5) 
+        time.sleep(7) 
 
         # Step 1: Email Screen
-        # Switch to iframe if present
+        # Cognito often uses a single iframe for the whole login widget
         if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
             driver.switch_to.frame(0)
             
-        email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or contains(@name, 'username')]")))
+        # Target Cognito Username field
+        email_field = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[name='username'], #username, input[type='email']")))
+        email_field.clear()
         email_field.send_keys(email)
         
-        # Click "Next" or "Continue" button
-        next_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Continue') or @type='submit']")
+        # Find and click Next/Submit
+        next_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button")))
         next_btn.click()
         
-        # Step 2: Password Screen (Wait for transition)
-        time.sleep(4)
-        pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password' or contains(@name, 'password')]")))
+        # Step 2: Password Screen
+        # Wait for transition - don't use sleep alone, wait for the element to actually exist
+        time.sleep(3) 
+        pass_field = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
+        pass_field.clear()
         pass_field.send_keys(password)
         
-        # Click final "Sign In" or "Login" button
-        login_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Sign In') or contains(text(), 'Log In') or @type='submit']")
+        # Final Login click
+        login_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button")))
         login_btn.click()
         
-        # Step 3: Wait for session established
-        time.sleep(10)
+        # Step 3: Wait for landing page and cookies
+        # Cognito redirects can be slow on headless
+        time.sleep(12)
         
-        # Capture cookies
-        captured = False
-        for _ in range(3):
+        # Check if login was successful by looking for any cookie that implies a session
+        for _ in range(5):
             cookies = driver.get_cookies()
-            if cookies:
+            if any(c['name'].startswith('CognitoIdentity') or 'session' in c['name'].lower() or 'token' in c['name'].lower() for c in cookies):
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
-                captured = True
-                break
+                return sess
             time.sleep(3)
             
-        return sess if captured else None
+        # Last effort capture
+        cookies = driver.get_cookies()
+        if cookies:
+            for cookie in cookies:
+                sess.cookies.set(cookie['name'], cookie['value'])
+            return sess
+            
+        return None
         
     except Exception as e:
-        st.error(f"Auth Flow interrupted: {str(e)}")
+        st.error(f"Login failed during automation: {str(e)}")
         return None
     finally:
         if driver:
@@ -132,7 +143,10 @@ def authenticate_headless(email, password):
 def get_dashboard_data(_sess):
     if _sess is None: return None, None
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*'
+        }
         r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         
         if r.status_code != 200: 
@@ -177,10 +191,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Executing multi-step login..."):
+                    with st.spinner("Processing multi-step login..."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication failed. Please verify credentials.")
+                        else: st.error("Authentication failed. Please verify credentials or try again.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
