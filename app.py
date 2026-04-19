@@ -133,8 +133,8 @@ def authenticate_headless(email, password):
             except: pass
 
 @st.cache_data(ttl=60)
-def get_dashboard_data(_sess, target_date_str):
-    if _sess is None: return None, None
+def get_dashboard_data(_sess, target_date_obj):
+    if _sess is None: return None, None, None
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -142,55 +142,73 @@ def get_dashboard_data(_sess, target_date_str):
             'Referer': f'{BASE}/volunteer/',
         }
         
-        # Step 1: Get Shifts
-        # Based on bv_scraper, we fetch shifts including users and roles
+        # Step 1: Get ALL Shifts for this event (the API usually returns a reasonable chunk)
         shifts_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts"
-        params = {
-            "includeShiftRoles": "true",
-            "includeShiftUsers": "true"
-        }
+        # Force include users here as well as a backup
+        r_shifts = _sess.get(shifts_url, params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
+        if r_shifts.status_code != 200: return None, None, None
         
-        r = _sess.get(shifts_url, params=params, headers=headers)
-        if r.status_code != 200: 
-            return None, None
+        all_shifts_raw = r_shifts.json()
+        shift_defs = {s['id']: s for s in all_shifts_raw}
         
-        all_shifts = r.json()
-        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        # Step 2: Get Enrollments 
+        enroll_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments"
+        r_enroll = _sess.get(enroll_url, headers=headers)
+        if r_enroll.status_code != 200: return None, None, None
         
-        target_shifts = []
+        enrollments = r_enroll.json()
+        
+        # Step 3: Filter for Target Date (Normalizing all to LOCAL_TZ)
+        active_enrollments = []
         uids = set()
         
-        for s in all_shifts:
-            try:
-                # API usually returns ISO Z time
-                sd_utc = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00'))
+        for e in enrollments:
+            s_id = e.get('eventShiftId')
+            s_def = shift_defs.get(s_id)
+            if s_def:
+                # Convert shift start to local time before checking the date
+                sd_utc = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00'))
                 sd_local = sd_utc.astimezone(LOCAL_TZ)
                 
-                if sd_local.date() == target_date:
-                    target_shifts.append(s)
-                    for role in s.get("roles", []):
-                        for user in role.get("users", []):
-                            uids.add(user["id"])
-            except:
-                continue
+                if sd_local.date() == target_date_obj:
+                    active_enrollments.append(e)
+                    uids.add(e['userId'])
+
+        # Backup Logic: If enrollments was empty, try checking if shift_users has the data
+        if not active_enrollments:
+            for s_id, s_def in shift_defs.items():
+                sd_utc = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00'))
+                sd_local = sd_utc.astimezone(LOCAL_TZ)
+                if sd_local.date() == target_date_obj:
+                    for role in s_def.get('roles', []):
+                        for user in role.get('users', []):
+                            # Synthetic enrollment record to keep logic consistent
+                            active_enrollments.append({
+                                'eventShiftId': s_id,
+                                'userId': user['id'],
+                                'firstName': user['firstName'],
+                                'lastName': user['lastName'],
+                                'eventRoleId': role['id']
+                            })
+                            uids.add(user['id'])
                     
-        # Step 2: Get Service Times (Punches) for all relevant users
+        # Step 4: Multi-threaded Service Time Fetch
         service_map = {}
         def fetch_user_svc(uid):
             svc_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
             res = _sess.get(svc_url, headers=headers)
             return uid, res.json() if res.status_code == 200 else []
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=10) as pool:
             futures = [pool.submit(fetch_user_svc, uid) for uid in uids]
             for f in as_completed(futures):
                 uid, data = f.result()
                 service_map[uid] = data
                 
-        return target_shifts, service_map
+        return shift_defs, active_enrollments, service_map
     except Exception as e:
         st.error(f"Data Fetch Error: {e}")
-        return None, None
+        return None, None, None
 
 # ─── App UI ───
 if 'sess' not in st.session_state:
@@ -214,16 +232,9 @@ with st.sidebar:
         if st.button("Log Out"): 
             st.session_state.sess = None
             st.rerun()
-            
-    with st.expander("🛠 Debug Data"):
-        if st.session_state.sess:
-            st.write("Session Cookies Active")
-        else:
-            st.write("No session found.")
 
 if st.session_state.sess:
     now = datetime.now(LOCAL_TZ)
-    
     col1, col2 = st.columns([3, 1])
     with col2:
         target_date = st.date_input("📅 Select Date", value=now.date())
@@ -231,74 +242,76 @@ if st.session_state.sess:
         st.title(f"Refuge Roster — {target_date.strftime('%A, %b %d')}")
     
     with st.spinner("Updating board..."):
-        shifts, svc_data = get_dashboard_data(st.session_state.sess, target_date.strftime("%Y-%m-%d"))
+        shift_defs, enrollments, svc_data = get_dashboard_data(st.session_state.sess, target_date)
     
-    if shifts:
+    if enrollments:
         cards = []
-        for s in shifts:
-            s_id = s['id']
+        for e in enrollments:
+            s_id = e['eventShiftId']
+            u_id = e['userId']
+            s_def = shift_defs.get(s_id)
+            if not s_def: continue
+            
+            name = f"{e.get('firstName', 'Volunteer')} {e.get('lastName', '')}"
+            
             try:
-                # Shift scheduled times
-                start = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                end = datetime.fromisoformat(s['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                end = datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
             except: continue
             
-            for role in s.get("roles", []):
-                role_nm = role.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
-                for u in role.get("users", []):
-                    uid = u['id']
-                    name = f"{u['firstName']} {u['lastName']}"
-                    
-                    # Logic match from bv_scraper: find the service record matching this shift
-                    user_punches = svc_data.get(uid, [])
-                    # Match by shift ID specifically
-                    rec = next((p for p in user_punches if p.get('eventShiftId') == s_id), None)
-                    
-                    cin_raw = rec.get('startTimestamp') if rec else None
-                    cout_raw = rec.get('endTimestamp') if rec else None
-                    
-                    cin_dt = datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cin_raw else None
-                    cout_dt = datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cout_raw else None
-                    
-                    # Formatting punch times for UI
-                    c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
-                    c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
-                    time_display = f"In: {c_in_str} → Out: {c_out_str}"
+            role_nm = "Volunteer"
+            for r in s_def.get("roles", []):
+                if r.get('id') == e.get('eventRoleId'):
+                    role_nm = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                    break
 
-                    # Status Logic
-                    status, css = "Pending", "status-pending"
-                    
-                    if cin_dt and cout_dt:
-                        if cin_dt > start + timedelta(minutes=10):
-                            status, css = "Completed (Late In)", "status-late"
-                        else:
-                            status, css = "Completed", "status-completed"
-                    elif cin_dt and not cout_dt:
-                        if now > end + timedelta(minutes=10):
-                            status, css = "Missing Clock-Out", "status-alert-red"
-                        elif cin_dt > start + timedelta(minutes=10):
-                            status, css = "Checked In (Late)", "status-late"
-                        else:
-                            status, css = "Checked In", "status-checked-in"
-                    else:
-                        if now > start + timedelta(minutes=10):
-                            status, css = "Missing Check-In", "status-alert-red"
-                        elif now >= start - timedelta(minutes=30):
-                            status, css = "Due Soon", "status-upcoming"
+            user_punches = svc_data.get(u_id, [])
+            # Search for the punch that matches this specific shift
+            rec = next((p for p in user_punches if p.get('eventShiftId') == s_id), None)
+            
+            cin_raw = rec.get('startTimestamp') if rec else None
+            cout_raw = rec.get('endTimestamp') if rec else None
+            
+            cin_dt = datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cin_raw else None
+            cout_dt = datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cout_raw else None
+            
+            c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
+            c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
+            time_display = f"In: {c_in_str} → Out: {c_out_str}"
 
-                    cards.append({
-                        "time": start,
-                        "html": f"""
-                        <div class="shift-card {css}">
-                            <div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div>
-                            <div class="shift-name">{name}</div>
-                            <div class="shift-role">{role_nm}</div>
-                            <div class="punch-time">🕒 {time_display}</div>
-                            <br/>
-                            <span class="status-badge">{status}</span>
-                        </div>
-                        """
-                    })
+            status, css = "Pending", "status-pending"
+            
+            if cin_dt and cout_dt:
+                if cin_dt > start + timedelta(minutes=10):
+                    status, css = "Completed (Late In)", "status-late"
+                else:
+                    status, css = "Completed", "status-completed"
+            elif cin_dt and not cout_dt:
+                if now > end + timedelta(minutes=10):
+                    status, css = "Missing Clock-Out", "status-alert-red"
+                elif cin_dt > start + timedelta(minutes=10):
+                    status, css = "Checked In (Late)", "status-late"
+                else:
+                    status, css = "Checked In", "status-checked-in"
+            else:
+                if now > start + timedelta(minutes=10):
+                    status, css = "Missing Check-In", "status-alert-red"
+                elif now >= start - timedelta(minutes=30):
+                    status, css = "Due Soon", "status-upcoming"
+
+            cards.append({
+                "time": start,
+                "html": f"""
+                <div class="shift-card {css}">
+                    <div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div>
+                    <div class="shift-name">{name}</div>
+                    <div class="shift-role">{role_nm}</div>
+                    <div class="punch-time">🕒 {time_display}</div>
+                    <br/>
+                    <span class="status-badge">{status}</span>
+                </div>
+                """
+            })
         
         if cards:
             cards.sort(key=lambda x: x['time'])
@@ -306,11 +319,9 @@ if st.session_state.sess:
             for i, c in enumerate(cards):
                 with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No shifts found for this date.")
-    elif shifts is not None:
-        st.info("No shifts found for this date.")
+            st.info(f"No active shifts found for {target_date.strftime('%m/%d')}.")
     else:
-        st.warning("Data fetch failed. Your session may have expired.")
+        st.info(f"No volunteer schedule found for {target_date.strftime('%m/%d')}.")
                 
     time.sleep(60)
     st.rerun()
