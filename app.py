@@ -44,6 +44,7 @@ st.markdown("""
     .shift-name { font-size: 1.4rem; font-weight: 800; margin-bottom: 0.1rem; }
     .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #888; font-weight: 600; margin-bottom: 1rem; }
     .status-badge { padding: 0.4rem 0.8rem; border-radius: 20px; font-weight: 700; font-size: 0.75rem; text-transform: uppercase; }
+    
     .status-checked-in { border-left-color: #28a745 !important; background-color: rgba(40, 167, 69, 0.08); }
     .status-checked-in .status-badge { background-color: #28a745; color: white; }
     .status-checked-out { border-left-color: #fd7e14 !important; background-color: rgba(253, 126, 20, 0.08); }
@@ -79,41 +80,45 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        wait = WebDriverWait(driver, 45)
+        wait = WebDriverWait(driver, 30)
+        time.sleep(5) 
         
-        # Wait for page to settle
-        time.sleep(6) 
-        
-        # Handle potential iframes
+        # Check for iframe (Cognito common behavior)
         if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
             driver.switch_to.frame(0)
             
-        # Locate fields
-        email_el = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @name='username' or @id='email' or @id='username']")))
-        pass_el = driver.find_element(By.XPATH, "//input[@type='password' or @name='password' or @id='password']")
+        # Selectors updated for Bloomerang's AWS Cognito implementation
+        email_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[contains(@id, 'username') or contains(@name, 'username') or @type='email']")))
+        pass_field = driver.find_element(By.XPATH, "//input[contains(@id, 'password') or @type='password']")
         
-        email_el.send_keys(email)
-        pass_el.send_keys(password)
+        email_field.send_keys(email)
+        pass_field.send_keys(password)
         
-        login_btn = driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Sign In') or contains(text(), 'Log In')]")
+        # Click login button
+        login_btn = driver.find_element(By.XPATH, "//button[contains(@name, 'signInSubmitButton') or contains(text(), 'Sign In') or @type='submit']")
         login_btn.click()
         
-        # Wait for either a URL change or the dashboard to appear
-        # We increase the sleep here because Cognito redirects are multi-step
-        time.sleep(8) 
+        # Wait for redirects (crucial on cloud)
+        time.sleep(10)
         
-        # Capture cookies safely
-        cookies = driver.get_cookies()
-        if not cookies:
-            st.error("Login failed: No cookies captured. Check credentials or site accessibility.")
-            return None
-
-        for cookie in cookies:
-            sess.cookies.set(cookie['name'], cookie['value'])
+        # Try to capture cookies up to 3 times
+        for _ in range(3):
+            cookies = driver.get_cookies()
+            if any("session" in c['name'].lower() or "token" in c['name'].lower() for c in cookies):
+                for cookie in cookies:
+                    sess.cookies.set(cookie['name'], cookie['value'])
+                return sess
+            time.sleep(3)
             
-        return sess
+        # Fallback: capture whatever cookies are there
+        if cookies:
+            for cookie in cookies:
+                sess.cookies.set(cookie['name'], cookie['value'])
+            return sess
+            
+        return None
     except Exception as e:
-        st.error(f"Login failed: {str(e)}")
+        st.error(f"Browser Auth Error: {str(e)}")
         return None
     finally:
         if driver:
@@ -122,14 +127,10 @@ def authenticate_headless(email, password):
 
 @st.cache_data(ttl=60)
 def get_dashboard_data(_sess):
+    if _sess is None: return None, None
     try:
-        # Check if session is valid
         r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"})
-        if r.status_code == 401:
-            st.warning("Session expired. Please log in again.")
-            return None, None
-        if r.status_code != 200: 
-            return None, None
+        if r.status_code != 200: return None, None
         
         shifts = r.json()
         now_local = datetime.now(LOCAL_TZ)
@@ -168,9 +169,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in... This may take up to 45 seconds"):
+                    with st.spinner("Logging in... This takes ~30 seconds on first run."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
+                        else: st.error("Authentication failed. Please check credentials.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
@@ -226,7 +228,7 @@ if st.session_state.get('sess'):
         else:
             st.info("No shifts found for today.")
     elif shifts is None and svc_data is None:
-        st.warning("Could not load data. Session might be invalid.")
+        st.warning("No data found or session invalid. Try logging in again.")
                 
     time.sleep(60)
     st.rerun()
