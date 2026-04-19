@@ -6,13 +6,18 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# Try imports with error handling to help debug in the Streamlit UI
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+except ImportError as e:
+    st.error(f"Missing Dependencies: {e}. Please ensure requirements.txt exists in your GitHub root.")
+    st.stop()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 BASE = "https://volunteer.bloomerang.co"
@@ -34,40 +39,24 @@ st.markdown("""
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         color: #1a1a1a;
     }
-    [data-theme="dark"] .shift-card {
-        background-color: #1e2130;
-        color: #ffffff;
-    }
+    [data-theme="dark"] .shift-card { background-color: #1e2130; color: #ffffff; }
     .shift-time { font-size: 1rem; font-weight: 700; color: #666; margin-bottom: 0.3rem; }
     .shift-name { font-size: 1.4rem; font-weight: 800; margin-bottom: 0.1rem; }
     .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #888; font-weight: 600; margin-bottom: 1rem; }
-    
-    .status-badge {
-        padding: 0.4rem 0.8rem;
-        border-radius: 20px;
-        font-weight: 700;
-        font-size: 0.75rem;
-        text-transform: uppercase;
-    }
-    
+    .status-badge { padding: 0.4rem 0.8rem; border-radius: 20px; font-weight: 700; font-size: 0.75rem; text-transform: uppercase; }
     .status-checked-in { border-left-color: #28a745 !important; background-color: rgba(40, 167, 69, 0.08); }
     .status-checked-in .status-badge { background-color: #28a745; color: white; }
-    
     .status-checked-out { border-left-color: #fd7e14 !important; background-color: rgba(253, 126, 20, 0.08); }
     .status-checked-out .status-badge { background-color: #fd7e14; color: white; }
-    
     .status-alert-red { border-left-color: #dc3545 !important; background-color: rgba(220, 53, 69, 0.08); }
     .status-alert-red .status-badge { background-color: #dc3545; color: white; }
-    
     .status-pending { border-left-color: #6c757d !important; background-color: #f8f9fa; }
     .status-pending .status-badge { background-color: #6c757d; color: white; }
-
     .status-upcoming { border-left-color: #007bff !important; background-color: rgba(0, 123, 255, 0.08); }
     .status-upcoming .status-badge { background-color: #007bff; color: white; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Auth Logic ───
 def authenticate_headless(email, password):
     options = Options()
     options.add_argument("--headless=new")
@@ -76,36 +65,40 @@ def authenticate_headless(email, password):
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
-    # Cloud specific: try to find the chromium binary installed via packages.txt
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
-    elif os.path.exists("/usr/bin/chromium-browser"):
-        options.binary_location = "/usr/bin/chromium-browser"
-
-    sess = requests.Session()
     
+    sess = requests.Session()
+    driver = None
     try:
-        # On Streamlit Cloud, we often need to point directly to the installed driver
-        driver_path = "/usr/bin/chromedriver"
-        if os.path.exists(driver_path):
-            service = Service(driver_path)
+        if os.path.exists("/usr/bin/chromedriver"):
+            service = Service("/usr/bin/chromedriver")
         else:
             service = Service(ChromeDriverManager().install())
             
         driver = webdriver.Chrome(service=service, options=options)
-        
         driver.get(f"{BASE}/volunteer/#/login")
-        wait = WebDriverWait(driver, 30)
         
-        # Look for Cognito login fields
-        email_el = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @name='username' or @id='email']")))
+        # Longer wait for the initial page and possible iframes
+        wait = WebDriverWait(driver, 45)
+        
+        # HANDLE IFRAME: Some Bloomerang/Cognito setups wrap the login form
+        time.sleep(5) # Allow JS to settle
+        if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+            driver.switch_to.frame(0)
+            
+        # Try to find login fields with expanded selectors
+        email_el = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @name='username' or @id='email' or @id='username']")))
         pass_el = driver.find_element(By.XPATH, "//input[@type='password' or @name='password' or @id='password']")
         
         email_el.send_keys(email)
         pass_el.send_keys(password)
         
-        login_btn = driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Sign In')]")
+        login_btn = driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Sign In') or contains(text(), 'Log In')]")
         login_btn.click()
+        
+        # Switch back to main content if we were in a frame
+        driver.switch_to.default_content()
         
         # Wait for redirect to dashboard
         wait.until(EC.url_contains("dashboard"))
@@ -116,13 +109,14 @@ def authenticate_headless(email, password):
             
         return sess
     except Exception as e:
-        st.error(f"Authentication Error: {str(e)}")
+        st.error(f"Login failed: {str(e)}")
+        # Optional: Save screenshot to debug if still failing
+        # driver.save_screenshot("login_error.png")
         return None
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
+        if driver:
+            try: driver.quit()
+            except: pass
 
 @st.cache_data(ttl=60)
 def get_dashboard_data(_sess):
@@ -153,29 +147,28 @@ def get_dashboard_data(_sess):
             for f in as_completed(futures):
                 uid, data = f.result()
                 service_map[uid] = data
-                
         return todays_shifts, service_map
     except Exception as e:
         st.error(f"Data Fetch Error: {e}")
         return None, None
 
-# ─── App Layout ───
+# ─── App UI ───
 with st.sidebar:
     st.title("🐾 Staff Access")
     if 'sess' not in st.session_state or st.session_state.sess is None:
         with st.form("auth_form"):
             user_email = st.text_input("Bloomerang Email")
             user_pw = st.text_input("Password", type="password")
-            if st.form_submit_button("Start Session"):
-                if not user_email or not user_pw:
-                    st.warning("Please enter credentials.")
-                else:
-                    with st.spinner("Logging in..."):
+            if st.form_submit_button("Log In"):
+                if user_email and user_pw:
+                    with st.spinner("Logging in... This may take up to 30 seconds"):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
+                else:
+                    st.warning("Please enter your credentials.")
     else:
-        st.success("Authorized")
-        if st.button("Manual Refresh"): 
+        st.success("Session Active")
+        if st.button("Refresh Board"): 
             st.cache_data.clear()
             st.rerun()
         if st.button("Log Out"): 
@@ -186,7 +179,7 @@ if st.session_state.get('sess'):
     now = datetime.now(LOCAL_TZ)
     st.title(f"Refuge Roster — {now.strftime('%A, %b %d')}")
     
-    with st.spinner("Syncing latest check-ins..."):
+    with st.spinner("Fetching latest data..."):
         shifts, svc_data = get_dashboard_data(st.session_state.sess)
     
     if shifts:
@@ -201,51 +194,34 @@ if st.session_state.get('sess'):
                 for u in role.get("users", []):
                     uid = u['id']
                     name = f"{u['firstName']} {u['lastName']}"
-                    
                     recs = svc_data.get(uid, []) if svc_data else []
                     rec = next((r for r in recs if r.get('eventShiftId') == s_id and r.get('isActive')), None)
-                    
-                    cin = rec.get('startTimestamp') if rec else None
-                    cout = rec.get('endTimestamp') if rec else None
+                    cin, cout = (rec.get('startTimestamp') if rec else None), (rec.get('endTimestamp') if rec else None)
                     
                     status, css = "Pending", "status-pending"
-                    
-                    if cin and cout:
-                        status, css = "Checked Out", "status-checked-out"
-                    elif cin and not cout:
-                        if now > end + timedelta(minutes=10):
-                            status, css = "Missing Clock-Out", "status-alert-red"
-                        else:
-                            status, css = "Checked In", "status-checked-in"
+                    if cin and cout: status, css = "Checked Out", "status-checked-out"
+                    elif cin:
+                        status, css = ("Missing Clock-Out", "status-alert-red") if now > end + timedelta(minutes=10) else ("Checked In", "status-checked-in")
                     else:
-                        if now > start + timedelta(minutes=10):
-                            status, css = "Late Check-In", "status-alert-red"
-                        elif now >= start - timedelta(minutes=30):
-                            status, css = "Due Soon", "status-upcoming"
+                        if now > start + timedelta(minutes=10): status, css = "Late Check-In", "status-alert-red"
+                        elif now >= start - timedelta(minutes=30): status, css = "Due Soon", "status-upcoming"
 
                     cards.append({
                         "time": start,
-                        "html": f"""
-                        <div class="shift-card {css}">
-                            <div class="shift-time">{start.strftime('%I:%M %p')} - {end.strftime('%I:%M %p')}</div>
-                            <div class="shift-name">{name}</div>
-                            <div class="shift-role">{role_nm}</div>
-                            <span class="status-badge">{status}</span>
-                        </div>
-                        """
+                        "html": f'<div class="shift-card {css}"><div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div><div class="shift-name">{name}</div><div class="shift-role">{role_nm}</div><span class="status-badge">{status}</span></div>'
                     })
         
         if cards:
             cards.sort(key=lambda x: x['time'])
             cols = st.columns(4)
             for i, c in enumerate(cards):
-                with cols[i % 4]:
-                    st.markdown(c['html'], unsafe_allow_html=True)
+                with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No shifts scheduled for today.")
+            st.info("No more shifts scheduled for today.")
+    else:
+        st.info("No shifts found for today.")
                 
-    st.info("Live data auto-refreshes every 60 seconds.")
     time.sleep(60)
     st.rerun()
 else:
-    st.info("Use the sidebar to log in and view today's shifts.")
+    st.info("Please log in using the sidebar to view today's volunteer roster.")
