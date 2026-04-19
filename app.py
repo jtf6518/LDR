@@ -81,57 +81,64 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        wait = WebDriverWait(driver, 20)
-        time.sleep(5) 
+        wait = WebDriverWait(driver, 25)
+        
+        # Function to find and enter text into an element across frames
+        def find_and_type(selectors, value, click_after=None):
+            for _ in range(2): # Try twice (once in current frame, once after resetting)
+                for selector in selectors:
+                    try:
+                        el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                        el.clear()
+                        el.send_keys(value)
+                        if click_after:
+                            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, click_after)))
+                            btn.click()
+                        return True
+                    except:
+                        continue
+                # If not found, try switching to the first iframe
+                driver.switch_to.default_content()
+                if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
+                    driver.switch_to.frame(0)
+            return False
 
-        # Iframe Handling
-        if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
-            driver.switch_to.frame(0)
-            
         # STEP 1: Email
-        # Using multi-selector approach for robustness
-        email_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='username'], #username, input[type='email']")))
-        email_field.clear()
-        email_field.send_keys(email)
+        time.sleep(5)
+        email_selectors = ["#signInFormUsername", "input[name='username']", "input[type='email']"]
+        next_selectors = ["button[type='submit']", "input[name='signInSubmitButton']", ".submit-button"]
         
-        next_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button, button.btn-primary")))
-        next_btn.click()
-        
-        # STEP 2: Password
-        # We wait for the password field to appear. 
-        # Sometimes Cognito transitions within the same frame, sometimes it reloads.
-        time.sleep(3)
-        try:
-            # Re-check frame if element is not found immediately
-            pass_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
-        except TimeoutException:
-            # Try switching back to main and checking frames again
-            driver.switch_to.default_content()
-            if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
-                driver.switch_to.frame(0)
-            pass_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[name='password'], #password, input[type='password']")))
+        if not find_and_type(email_selectors, email, click_after=next_selectors[0]):
+            st.error("Could not find Email field. Page structure might have changed.")
+            return None
 
-        pass_field.clear()
-        pass_field.send_keys(password)
+        # STEP 2: Password
+        # Significant wait for Cognito state transition
+        time.sleep(4)
+        pass_selectors = ["#signInFormPassword", "input[name='password']", "input[type='password']"]
         
-        login_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit'], .submit-button, #submit-button, button.btn-primary")))
-        login_btn.click()
+        if not find_and_type(pass_selectors, password, click_after=next_selectors[0]):
+            st.error("Could not find Password field after clicking Next.")
+            return None
         
-        # STEP 3: Capturing Session
-        time.sleep(10)
+        # STEP 3: Wait for redirect and capture cookies
+        time.sleep(12)
         
+        captured = False
         for _ in range(5):
             cookies = driver.get_cookies()
-            if cookies and any('cognito' in c['name'].lower() or 'session' in c['name'].lower() for c in cookies):
+            # Look for ANY cookies, Cognito ones are usually long strings
+            if cookies and len(cookies) > 2:
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
-                return sess
+                captured = True
+                break
             time.sleep(2)
             
-        return None
+        return sess if captured else None
         
     except Exception as e:
-        st.error(f"Login Automation Error: {str(e)}")
+        st.error(f"Automation Error: {str(e)}")
         return None
     finally:
         if driver:
@@ -176,7 +183,7 @@ def get_dashboard_data(_sess):
                 service_map[uid] = data
         return todays_shifts, service_map
     except Exception as e:
-        st.error(f"Data API Error: {e}")
+        st.error(f"API Fetch Error: {e}")
         return None, None
 
 # ─── App UI ───
@@ -188,10 +195,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in to Bloomerang..."):
+                    with st.spinner("Logging in... this takes about 40 seconds."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication failed. Check your password or try again.")
+                        else: st.error("Authentication failed. Check logs or try again.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
@@ -207,7 +214,7 @@ if st.session_state.get('sess'):
     now = datetime.now(LOCAL_TZ)
     st.title(f"Refuge Roster — {now.strftime('%A, %b %d')}")
     
-    with st.spinner("Fetching today's schedule..."):
+    with st.spinner("Updating board..."):
         shifts, svc_data = get_dashboard_data(st.session_state.sess)
     
     if shifts:
