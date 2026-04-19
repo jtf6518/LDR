@@ -15,7 +15,6 @@ try:
     from webdriver_manager.chrome import ChromeDriverManager
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
 except ImportError as e:
     st.error(f"Missing Dependencies: {e}. Please ensure requirements.txt exists in your GitHub root.")
     st.stop()
@@ -65,7 +64,11 @@ def authenticate_headless(email, password):
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--window-size=1280,900")
+    
+    # Stealth options to prevent AWS WAF from blocking the headless browser
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
@@ -79,76 +82,54 @@ def authenticate_headless(email, password):
             service = Service(ChromeDriverManager().install())
             
         driver = webdriver.Chrome(service=service, options=options)
+        wait = WebDriverWait(driver, 15) # 15 seconds is plenty if the page isn't blocked
+        
+        # 1. Load Page
         driver.get(f"{BASE}/volunteer/#/login")
+        time.sleep(4) # Let React render
         
-        wait = WebDriverWait(driver, 30)
+        # 2. Enter Email
+        email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
+        email_field.click()
+        email_field.clear()
+        email_field.send_keys(email)
         
-        def find_and_type(selectors, value, click_after_selectors=None):
-            for _ in range(3): # Try multiple times for iframe detection
-                for selector in selectors:
-                    try:
-                        el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                        el.click() # Focus first
-                        time.sleep(0.5)
-                        el.clear()
-                        # Simulate typing
-                        for char in value:
-                            el.send_keys(char)
-                        
-                        if click_after_selectors:
-                            btn = None
-                            for b_sel in click_after_selectors:
-                                try:
-                                    btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, b_sel)))
-                                    break
-                                except: continue
-                            if btn:
-                                btn.click()
-                        return True
-                    except:
-                        continue
-                
-                # Check for iframes if not found
-                driver.switch_to.default_content()
-                iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                if len(iframes) > 0:
-                    driver.switch_to.frame(0)
-                time.sleep(1)
-            return False
-
-        # STEP 1: Email
-        time.sleep(6)
-        email_selectors = ["#signInFormUsername", "input[name='username']", "input[type='email']"]
-        button_selectors = ["button[type='submit']", "input[name='signInSubmitButton']", ".submit-button", "button.btn-primary"]
+        # 3. Click Next
+        next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')] | //button[@type='submit']")))
+        next_btn.click()
         
-        if not find_and_type(email_selectors, email, click_after_selectors=button_selectors):
-            st.error("Failed to enter Email.")
-            return None
-
-        # STEP 2: Password
-        # Cognito transition can be slow
-        time.sleep(5)
-        pass_selectors = ["#signInFormPassword", "input[name='password']", "input[type='password']"]
+        # 4. Wait for Password Transition
+        time.sleep(3) # Let React animate the transition
+        pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
+        pass_field.click()
+        pass_field.clear()
+        pass_field.send_keys(password)
         
-        if not find_and_type(pass_selectors, password, click_after_selectors=button_selectors):
-            st.error("Failed to enter Password.")
-            return None
+        # 5. Click Log In
+        login_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in') or contains(., 'Sign In') or @type='submit']")))
+        login_btn.click()
         
-        # STEP 3: Wait for landing
-        time.sleep(15)
+        # 6. Wait for Auth API & Redirect
+        time.sleep(8) 
         
-        for _ in range(5):
-            cookies = driver.get_cookies()
-            if cookies and len(cookies) > 2:
-                for cookie in cookies:
-                    sess.cookies.set(cookie['name'], cookie['value'])
-                return sess
-            time.sleep(3)
+        # Capture Session
+        cookies = driver.get_cookies()
+        if not cookies or len(cookies) < 2:
+            raise Exception("Login clicked, but no session cookies were returned. Are credentials correct?")
             
-        return None
-        
+        for cookie in cookies:
+            sess.cookies.set(cookie['name'], cookie['value'])
+            
+        return sess
+
     except Exception as e:
-        st.error(f"Automation Critical Error: {str(e)}")
+        st.error(f"Login failed at UI step: {str(e)}")
+        # X-RAY VISUAL DEBUGGER: Grabs a screenshot of exactly what Chrome is seeing
+        if driver:
+            try:
+                st.image(driver.get_screenshot_as_png(), caption="Headless Browser Screenshot (What the script saw when it failed)")
+            except:
+                pass
         return None
     finally:
         if driver:
@@ -205,10 +186,9 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Executing secure login flow..."):
+                    with st.spinner("Running visual login flow..."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Login failed. Check your password or try again.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
