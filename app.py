@@ -32,42 +32,42 @@ st.markdown("""
 <style>
     .shift-card {
         background-color: #ffffff;
-        padding: 1.2rem;
-        border-radius: 12px;
-        margin-bottom: 1rem;
-        border-left: 8px solid #dee2e6;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.07);
+        padding: 1.4rem;
+        border-radius: 14px;
+        margin-bottom: 1.2rem;
+        border-left: 10px solid #cbd5e0;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
         color: #1a202c;
     }
-    [data-theme="dark"] .shift-card { background-color: #1a202c; color: #f7fafc; border-left-color: #4a5568; }
+    [data-theme="dark"] .shift-card { background-color: #1e2533; color: #f7fafc; border-left-color: #4a5568; }
     
-    .shift-time { font-size: 0.9rem; font-weight: 700; color: #718096; margin-bottom: 0.4rem; }
-    .shift-name { font-size: 1.3rem; font-weight: 800; margin-bottom: 0.2rem; line-height: 1.2; color: #2d3748; }
-    [data-theme="dark"] .shift-name { color: #edf2f7; }
-    .shift-role { font-size: 0.8rem; text-transform: uppercase; color: #a0aec0; font-weight: 700; margin-bottom: 0.8rem; letter-spacing: 0.05em; }
+    .shift-time { font-size: 0.95rem; font-weight: 700; color: #718096; margin-bottom: 0.5rem; }
+    .shift-name { font-size: 1.5rem; font-weight: 900; margin-bottom: 0.2rem; line-height: 1.1; color: #1a202c; }
+    [data-theme="dark"] .shift-name { color: #ffffff; }
+    .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #a0aec0; font-weight: 800; margin-bottom: 1rem; letter-spacing: 0.08em; }
     
-    .status-badge { padding: 0.4rem 0.8rem; border-radius: 20px; font-weight: 800; font-size: 0.7rem; text-transform: uppercase; display: inline-block; }
+    .status-badge { padding: 0.5rem 0.9rem; border-radius: 20px; font-weight: 900; font-size: 0.75rem; text-transform: uppercase; display: inline-block; }
     
-    .status-checked-in { border-left-color: #38a169 !important; background-color: rgba(56, 161, 105, 0.1); }
-    .status-checked-in .status-badge { background-color: #38a169; color: white; }
+    .status-checked-in { border-left-color: #2f855a !important; background-color: rgba(47, 133, 90, 0.1); }
+    .status-checked-in .status-badge { background-color: #2f855a; color: white; }
     
-    .status-completed { border-left-color: #805ad5 !important; background-color: rgba(128, 90, 213, 0.1); }
-    .status-completed .status-badge { background-color: #805ad5; color: white; }
+    .status-completed { border-left-color: #6b46c1 !important; background-color: rgba(107, 70, 193, 0.1); }
+    .status-completed .status-badge { background-color: #6b46c1; color: white; }
     
-    .status-alert-red { border-left-color: #e53e3e !important; background-color: rgba(229, 62, 62, 0.1); }
-    .status-alert-red .status-badge { background-color: #e53e3e; color: white; }
+    .status-alert-red { border-left-color: #c53030 !important; background-color: rgba(197, 48, 48, 0.1); }
+    .status-alert-red .status-badge { background-color: #c53030; color: white; }
     
-    .status-upcoming { border-left-color: #3182ce !important; background-color: rgba(49, 130, 206, 0.1); }
-    .status-upcoming .status-badge { background-color: #3182ce; color: white; }
+    .status-upcoming { border-left-color: #2b6cb0 !important; background-color: rgba(43, 108, 176, 0.1); }
+    .status-upcoming .status-badge { background-color: #2b6cb0; color: white; }
     
-    .status-pending { border-left-color: #a0aec0 !important; background-color: #f7fafc; }
-    .status-pending .status-badge { background-color: #718096; color: white; }
+    .status-pending { border-left-color: #718096 !important; background-color: #f7fafc; }
+    .status-pending .status-badge { background-color: #4a5568; color: white; }
     
     .punch-box {
-        margin-top: 10px; padding: 6px 10px; background: rgba(0,0,0,0.04); border-radius: 6px;
-        font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 0.85rem; font-weight: 600; color: #4a5568;
+        margin-top: 12px; padding: 8px 12px; background: rgba(0,0,0,0.05); border-radius: 8px;
+        font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 0.9rem; font-weight: 700; color: #2d3748;
     }
-    [data-theme="dark"] .punch-box { background: rgba(255,255,255,0.05); color: #a0aec0; }
+    [data-theme="dark"] .punch-box { background: rgba(255,255,255,0.08); color: #e2e8f0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -76,228 +76,189 @@ def authenticate_headless(email, password):
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,900")
-    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
-    if os.path.exists("/usr/bin/chromium"):
-        options.binary_location = "/usr/bin/chromium"
+    if os.path.exists("/usr/bin/chromium"): options.binary_location = "/usr/bin/chromium"
     
     sess = requests.Session()
     driver = None
     try:
-        if os.path.exists("/usr/bin/chromedriver"):
-            service = Service("/usr/bin/chromedriver")
-        else:
-            service = Service(ChromeDriverManager().install())
-            
+        service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        wait = WebDriverWait(driver, 15) 
+        wait = WebDriverWait(driver, 15)
         
         driver.get(f"{BASE}/volunteer/#/login")
-        time.sleep(4) 
+        time.sleep(3)
         
-        email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
-        email_field.click()
-        email_field.send_keys(email)
+        email_f = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
+        email_f.send_keys(email)
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')]"))).click()
         
-        next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')] | //button[@type='submit']")))
-        next_btn.click()
+        time.sleep(2)
+        pass_f = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
+        pass_f.send_keys(password)
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in')]"))).click()
         
-        time.sleep(3) 
-        pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
-        pass_field.click()
-        pass_field.send_keys(password)
-        
-        login_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in') or contains(., 'Sign In') or @type='submit']")))
-        login_btn.click()
-        
-        time.sleep(8) 
-        
-        cookies = driver.get_cookies()
-        if not cookies or len(cookies) < 2:
-            raise Exception("No cookies returned.")
-            
-        for cookie in cookies:
-            sess.cookies.set(cookie['name'], cookie['value'])
-            
+        time.sleep(7)
+        for c in driver.get_cookies(): sess.cookies.set(c['name'], c['value'])
         return sess
     except Exception as e:
-        st.error(f"Login failed: {str(e)}")
+        st.error(f"Login failed: {e}")
         return None
     finally:
-        if driver:
-            try: driver.quit()
-            except: pass
+        if driver: driver.quit()
 
 @st.cache_data(ttl=60)
 def get_dashboard_data(_sess, target_date_obj):
-    if _sess is None: return None, None
+    if not _sess: return None, None
+    headers = {'Accept': 'application/json', 'Referer': f'{BASE}/volunteer/'}
+    
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Referer': f'{BASE}/volunteer/',
-        }
+        # 1. Fetch data
+        s_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true"}, headers=headers).json()
+        shift_defs = {s['id']: s for s in s_raw}
         
-        # 1. Fetch Structural Data
-        r_shifts = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
-        if r_shifts.status_code != 200: return None, None
-        shift_defs = {s['id']: s for s in r_shifts.json()}
+        enrollments = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments", headers=headers).json()
+        attendance = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance", headers=headers).json()
         
-        # 2. Fetch Assignments
-        r_enroll = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments", headers=headers)
-        enrollments = r_enroll.json() if r_enroll.status_code == 200 else []
-        
-        # 3. Fetch Attendance
-        r_att = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance", headers=headers)
-        attendance = r_att.json() if r_att.status_code == 200 else []
-        
-        master_assignments = []
+        raw_people = []
         uids = set()
-        seen_keys = set()
-
-        def add_entry(sid, uid, fn, ln, rid):
-            if not sid or not uid or uid == 0: return # Filter invalid IDs
-            sdef = shift_defs.get(sid)
-            if not sdef: return
+        
+        # 2. Extract uniquely identified people with assignments
+        def process_person(item):
+            uid = item.get('userId')
+            sid = item.get('eventShiftId')
+            if not uid or not sid: return
             
-            s_local = datetime.fromisoformat(sdef['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            if s_local.date() != target_date_obj: return
+            s_def = shift_defs.get(sid)
+            if not s_def: return
             
-            key = f"{sid}-{uid}"
-            if key in seen_keys: return
-
-            # Get Role Name
-            role_name = "Volunteer"
-            for r in sdef.get('roles', []):
+            s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            if s_start.date() != target_date_obj: return
+            
+            # Find Role Name
+            rid = item.get('eventRoleId')
+            r_name = "Volunteer"
+            for r in s_def.get('roles', []):
                 if r.get('id') == rid:
-                    role_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                    r_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
                     break
-
-            master_assignments.append({
-                'sid': sid, 'uid': uid, 
-                'fname': fn if (fn and fn != "Volunteer" and fn != "None") else "", 
-                'lname': ln if (ln and ln != "None") else "",
-                'role': role_name,
-                'start': s_local,
-                'end': datetime.fromisoformat(sdef['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            
+            # Try to get a name
+            fn = item.get('firstName', '').strip()
+            ln = item.get('lastName', '').strip()
+            
+            raw_people.append({
+                'uid': uid, 'sid': sid, 'fname': fn, 'lname': ln, 'role': r_name,
+                'start': s_start, 'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
             })
             uids.add(uid)
-            seen_keys.add(key)
 
-        # Merge data sources
-        for e in enrollments: add_entry(e.get('eventShiftId'), e.get('userId'), e.get('firstName'), e.get('lastName'), e.get('eventRoleId'))
-        for a in attendance: add_entry(a.get('eventShiftId'), a.get('userId'), a.get('firstName'), a.get('lastName'), a.get('eventRoleId'))
-        for sid, sdef in shift_defs.items():
-            for role in sdef.get('roles', []):
-                for user in role.get('users', []):
-                    add_entry(sid, user.get('id'), user.get('firstName'), user.get('lastName'), role['id'])
+        for e in enrollments: process_person(e)
+        for a in attendance: process_person(a)
 
-        # 4. Cleanup Empty/Ghost Cards
+        # 3. Enrichment (Fetch Profiles & Punches)
         punch_map = {}
         profile_map = {}
 
         def fetch_meta(uid):
-            r_s = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime", headers=headers)
-            r_p = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}", headers=headers)
-            return uid, (r_s.json() if r_s.status_code == 200 else []), (r_p.json() if r_p.status_code == 200 else {})
+            p_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime", headers=headers).json()
+            prof_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}", headers=headers).json()
+            return uid, p_raw, prof_raw
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = [pool.submit(fetch_meta, uid) for uid in uids if uid]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(fetch_meta, uid) for uid in uids]
             for f in as_completed(futures):
-                uid, p_list, p_dict = f.result()
+                uid, p_list, prof = f.result()
                 punch_map[uid] = p_list
-                profile_map[uid] = p_dict
+                profile_map[uid] = prof
 
-        # Final Name and Empty Check
-        final_list = []
-        for a in master_assignments:
-            prof = profile_map.get(a['uid'], {})
-            # If we STILL have no name, try the profile endpoint's data
-            if not a['fname'] or a['fname'] == "Volunteer":
-                a['fname'] = prof.get('firstName', '').strip()
-                a['lname'] = prof.get('lastName', '').strip()
+        # 4. Filter & Clean
+        final_roster = []
+        seen = set()
+        for p in raw_people:
+            # Use Profile name if enrollment name is missing
+            prof = profile_map.get(p['uid'], {})
+            fname = p['fname'] if p['fname'] else prof.get('firstName', '')
+            lname = p['lname'] if p['lname'] else prof.get('lastName', '')
             
-            # Final sanity check: if there is no name at all, it's an unfilled shift
-            if not a['fname'] or a['fname'].lower() == "none":
-                continue
+            # ABSOLUTELY DISCARD if no name found - this kills the "No ID" cards
+            if not fname or fname.lower() in ["none", "volunteer"]: continue
             
-            final_list.append(a)
-
-        return final_list, punch_map
+            key = f"{p['sid']}-{p['uid']}"
+            if key in seen: continue
+            
+            p['fname'], p['lname'] = fname, lname
+            final_roster.append(p)
+            seen.add(key)
+            
+        return final_roster, punch_map
     except Exception as e:
-        st.error(f"Sync failed: {e}")
+        st.error(f"Sync error: {e}")
         return None, None
 
 # ─── App UI ───
-if 'sess' not in st.session_state:
-    st.session_state.sess = None
+if 'sess' not in st.session_state: st.session_state.sess = None
 
 with st.sidebar:
-    st.title("🐾 Staff Portal")
+    st.title("🐾 Staff Access")
     if st.session_state.sess is None:
-        with st.form("login"):
-            em = st.text_input("Email")
-            pw = st.text_input("Password", type="password")
+        with st.form("auth"):
+            u = st.text_input("Email")
+            p = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
-                st.session_state.sess = authenticate_headless(em, pw)
+                st.session_state.sess = authenticate_headless(u, p)
                 if st.session_state.sess: st.rerun()
     else:
         st.success("Connected")
-        if st.button("🔄 Refresh Board"): 
-            st.cache_data.clear()
-            st.rerun()
-        if st.button("🚪 Logout"): 
-            st.session_state.sess = None
-            st.rerun()
+        if st.button("Refresh Board"): st.cache_data.clear(); st.rerun()
+        if st.button("Logout"): st.session_state.sess = None; st.rerun()
 
 if st.session_state.sess:
     now = datetime.now(LOCAL_TZ)
     c1, c2 = st.columns([3, 1])
-    with c2:
-        t_date = st.date_input("Select Date", value=now.date())
-    with c1:
-        st.title(f"Roster — {t_date.strftime('%A, %b %d')}")
+    with c2: t_date = st.date_input("Board Date", value=now.date())
+    with c1: st.title(f"Roster: {t_date.strftime('%A, %b %d')}")
     
-    with st.spinner("Updating board..."):
-        assigns, punches = get_dashboard_data(st.session_state.sess, t_date)
+    with st.spinner("Syncing Bloomerang..."):
+        roster, punches = get_dashboard_data(st.session_state.sess, t_date)
     
-    if assigns:
+    if roster:
         cards = []
-        for a in assigns:
-            fname = f"{a['fname']} {a['lname']}".strip()
-            user_punches = punches.get(a['uid'], [])
-            punch = next((p for p in user_punches if p.get('eventShiftId') == a['sid']), None)
+        for v in roster:
+            fullName = f"{v['fname']} {v['lname']}".strip()
             
-            if not punch:
-                for p in user_punches:
+            # Punch Matching
+            user_p = punches.get(v['uid'], [])
+            my_punch = next((p for p in user_p if p.get('eventShiftId') == v['sid']), None)
+            
+            # Fallback: check date overlap if shift ID didn't match
+            if not my_punch:
+                for p in user_p:
                     if p.get('startTimestamp'):
-                        p_start = datetime.fromisoformat(p['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                        if p_start.date() == t_date:
-                            punch = p; break
+                        dt = datetime.fromisoformat(p['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                        if dt.date() == t_date: my_punch = p; break
 
-            cin = datetime.fromisoformat(punch['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if punch and punch.get('startTimestamp') else None
-            cout = datetime.fromisoformat(punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if punch and punch.get('endTimestamp') else None
+            cin = datetime.fromisoformat(my_punch['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('startTimestamp') else None
+            cout = datetime.fromisoformat(my_punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('endTimestamp') else None
+            
             p_str = f"In: {cin.strftime('%I:%M%p') if cin else '--'} → Out: {cout.strftime('%I:%M%p') if cout else '--'}"
-
+            
             status, css = "Scheduled", "status-pending"
-            if cin and cout:
-                status, css = "Completed", "status-completed"
-            elif cin:
-                status, css = ("Missing Out", "status-alert-red") if now > a['end'] + timedelta(minutes=20) else ("On Shift", "status-checked-in")
+            if cin and cout: status, css = "Completed", "status-completed"
+            elif cin: status, css = ("Late Out", "status-alert-red") if now > v['end'] + timedelta(minutes=15) else ("On Shift", "status-checked-in")
             else:
-                if now > a['start'] + timedelta(minutes=20): status, css = "Late/No Show", "status-alert-red"
-                elif now >= a['start'] - timedelta(minutes=60): status, css = "Upcoming", "status-upcoming"
+                if now > v['start'] + timedelta(minutes=15): status, css = "No Show / Late", "status-alert-red"
+                elif now >= v['start'] - timedelta(minutes=60): status, css = "Starting Soon", "status-upcoming"
 
             cards.append({
-                "time": a['start'],
+                "time": v['start'],
                 "html": f"""
                 <div class="shift-card {css}">
-                    <div class="shift-time">{a['start'].strftime("%I:%M %p")} - {a['end'].strftime("%I:%M %p")}</div>
-                    <div class="shift-name">{fname}</div>
-                    <div class="shift-role">{a['role']}</div>
+                    <div class="shift-time">{v['start'].strftime("%I:%M %p")} - {v['end'].strftime("%I:%M %p")}</div>
+                    <div class="shift-name">{fullName}</div>
+                    <div class="shift-role">{v['role']}</div>
                     <div class="punch-box">🕒 {p_str}</div>
                     <div style="margin-top:12px;"><span class="status-badge">{status}</span></div>
                 </div>
@@ -306,11 +267,11 @@ if st.session_state.sess:
         
         cards.sort(key=lambda x: x['time'])
         cols = st.columns(4)
-        for i, c in enumerate(cards):
-            with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
+        for i, card in enumerate(cards):
+            with cols[i % 4]: st.markdown(card['html'], unsafe_allow_html=True)
     else:
-        st.info(f"No volunteers signed up for {t_date.strftime('%m/%d')}.")
+        st.info(f"No volunteers confirmed for {t_date.strftime('%m/%d')}.")
     
     time.sleep(60); st.rerun()
 else:
-    st.warning("Please log in using the sidebar.")
+    st.info("Staff Login Required.")
