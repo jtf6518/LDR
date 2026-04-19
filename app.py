@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Try imports with error handling to help debug in the Streamlit UI
+# Try imports with error handling
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -16,7 +16,7 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 except ImportError as e:
-    st.error(f"Missing Dependencies: {e}. Please ensure requirements.txt exists in your GitHub root.")
+    st.error(f"Missing Dependencies: {e}")
     st.stop()
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -78,8 +78,6 @@ def authenticate_headless(email, password):
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,900")
-    
-    # Stealth options to prevent AWS WAF from blocking the headless browser
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     
@@ -102,7 +100,6 @@ def authenticate_headless(email, password):
         
         email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
         email_field.click()
-        email_field.clear()
         email_field.send_keys(email)
         
         next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')] | //button[@type='submit']")))
@@ -111,7 +108,6 @@ def authenticate_headless(email, password):
         time.sleep(3) 
         pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
         pass_field.click()
-        pass_field.clear()
         pass_field.send_keys(password)
         
         login_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in') or contains(., 'Sign In') or @type='submit']")))
@@ -121,7 +117,7 @@ def authenticate_headless(email, password):
         
         cookies = driver.get_cookies()
         if not cookies or len(cookies) < 2:
-            raise Exception("Login clicked, but no session cookies were returned. Are credentials correct?")
+            raise Exception("No cookies returned.")
             
         for cookie in cookies:
             sess.cookies.set(cookie['name'], cookie['value'])
@@ -129,10 +125,7 @@ def authenticate_headless(email, password):
         return sess
 
     except Exception as e:
-        st.error(f"Login failed at UI step: {str(e)}")
-        if driver:
-            try: st.image(driver.get_screenshot_as_png(), caption="Headless Browser Error Snapshot")
-            except: pass
+        st.error(f"Login failed: {str(e)}")
         return None
     finally:
         if driver:
@@ -145,75 +138,99 @@ def get_dashboard_data(_sess, target_date_str):
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': f'{BASE}/volunteer/',
         }
-        r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         
-        if r.status_code != 200: return None, None
+        # Step 1: Get Shifts
+        # Based on bv_scraper, we fetch shifts including users and roles
+        shifts_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts"
+        params = {
+            "includeShiftRoles": "true",
+            "includeShiftUsers": "true"
+        }
         
-        shifts = r.json()
+        r = _sess.get(shifts_url, params=params, headers=headers)
+        if r.status_code != 200: 
+            return None, None
+        
+        all_shifts = r.json()
         target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
         
         target_shifts = []
         uids = set()
-        for s in shifts:
+        
+        for s in all_shifts:
             try:
-                sd = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                if sd.date() == target_date:
+                # API usually returns ISO Z time
+                sd_utc = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00'))
+                sd_local = sd_utc.astimezone(LOCAL_TZ)
+                
+                if sd_local.date() == target_date:
                     target_shifts.append(s)
-                    for r_role in s.get("roles", []):
-                        for u in r_role.get("users", []): uids.add(u["id"])
-            except: continue
+                    for role in s.get("roles", []):
+                        for user in role.get("users", []):
+                            uids.add(user["id"])
+            except:
+                continue
                     
+        # Step 2: Get Service Times (Punches) for all relevant users
         service_map = {}
         def fetch_user_svc(uid):
-            res = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime", headers=headers)
+            svc_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
+            res = _sess.get(svc_url, headers=headers)
             return uid, res.json() if res.status_code == 200 else []
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [pool.submit(fetch_user_svc, uid) for uid in uids]
             for f in as_completed(futures):
                 uid, data = f.result()
                 service_map[uid] = data
+                
         return target_shifts, service_map
     except Exception as e:
-        st.error(f"API Fetch Error: {e}")
+        st.error(f"Data Fetch Error: {e}")
         return None, None
 
 # ─── App UI ───
+if 'sess' not in st.session_state:
+    st.session_state.sess = None
+
 with st.sidebar:
     st.title("🐾 Staff Access")
-    if 'sess' not in st.session_state or st.session_state.sess is None:
+    if st.session_state.sess is None:
         with st.form("auth_form"):
             user_email = st.text_input("Bloomerang Email")
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
-                if user_email and user_pw:
-                    with st.spinner("Running visual login flow..."):
-                        st.session_state.sess = authenticate_headless(user_email, user_pw)
-                        if st.session_state.sess: st.rerun()
-                else:
-                    st.warning("Please enter your credentials.")
+                with st.spinner("Authenticating..."):
+                    st.session_state.sess = authenticate_headless(user_email, user_pw)
+                    if st.session_state.sess: st.rerun()
     else:
         st.success("Session Active")
-        if st.button("Refresh Data"): 
+        if st.button("Refresh Roster"): 
             st.cache_data.clear()
             st.rerun()
         if st.button("Log Out"): 
             st.session_state.sess = None
             st.rerun()
+            
+    with st.expander("🛠 Debug Data"):
+        if st.session_state.sess:
+            st.write("Session Cookies Active")
+        else:
+            st.write("No session found.")
 
-if st.session_state.get('sess'):
+if st.session_state.sess:
     now = datetime.now(LOCAL_TZ)
     
-    # ─── Date Picker & Header ───
     col1, col2 = st.columns([3, 1])
     with col2:
         target_date = st.date_input("📅 Select Date", value=now.date())
     with col1:
-        date_label = "Today" if target_date == now.date() else target_date.strftime('%A, %b %d')
-        st.title(f"Refuge Roster — {date_label}")
+        st.title(f"Refuge Roster — {target_date.strftime('%A, %b %d')}")
     
-    with st.spinner(f"Fetching schedule for {target_date.strftime('%m/%d')}..."):
+    with st.spinner("Updating board..."):
         shifts, svc_data = get_dashboard_data(st.session_state.sess, target_date.strftime("%Y-%m-%d"))
     
     if shifts:
@@ -221,6 +238,7 @@ if st.session_state.get('sess'):
         for s in shifts:
             s_id = s['id']
             try:
+                # Shift scheduled times
                 start = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
                 end = datetime.fromisoformat(s['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
             except: continue
@@ -230,45 +248,43 @@ if st.session_state.get('sess'):
                 for u in role.get("users", []):
                     uid = u['id']
                     name = f"{u['firstName']} {u['lastName']}"
-                    recs = svc_data.get(uid, []) if svc_data else []
-                    rec = next((r for r in recs if r.get('eventShiftId') == s_id and r.get('isActive')), None)
                     
-                    # ─── Process Clock Times ───
+                    # Logic match from bv_scraper: find the service record matching this shift
+                    user_punches = svc_data.get(uid, [])
+                    # Match by shift ID specifically
+                    rec = next((p for p in user_punches if p.get('eventShiftId') == s_id), None)
+                    
                     cin_raw = rec.get('startTimestamp') if rec else None
                     cout_raw = rec.get('endTimestamp') if rec else None
                     
                     cin_dt = datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cin_raw else None
                     cout_dt = datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cout_raw else None
                     
-                    if cin_dt or cout_dt:
-                        c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
-                        c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
-                        time_display = f"In: {c_in_str}  →  Out: {c_out_str}"
-                    else:
-                        time_display = "No punches recorded"
+                    # Formatting punch times for UI
+                    c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
+                    c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
+                    time_display = f"In: {c_in_str} → Out: {c_out_str}"
 
-                    # ─── Status & Color Matrix ───
+                    # Status Logic
                     status, css = "Pending", "status-pending"
                     
                     if cin_dt and cout_dt:
                         if cin_dt > start + timedelta(minutes=10):
-                            status, css = "Completed (Late In)", "status-late" # Orange
+                            status, css = "Completed (Late In)", "status-late"
                         else:
-                            status, css = "Completed", "status-completed" # Purple
-                            
+                            status, css = "Completed", "status-completed"
                     elif cin_dt and not cout_dt:
                         if now > end + timedelta(minutes=10):
                             status, css = "Missing Clock-Out", "status-alert-red"
                         elif cin_dt > start + timedelta(minutes=10):
-                            status, css = "Checked In (Late)", "status-late" # Orange
+                            status, css = "Checked In (Late)", "status-late"
                         else:
-                            status, css = "Checked In", "status-checked-in" # Green
-                            
-                    else: # No check-in data at all
+                            status, css = "Checked In", "status-checked-in"
+                    else:
                         if now > start + timedelta(minutes=10):
                             status, css = "Missing Check-In", "status-alert-red"
                         elif now >= start - timedelta(minutes=30):
-                            status, css = "Due Soon", "status-upcoming" # Blue
+                            status, css = "Due Soon", "status-upcoming"
 
                     cards.append({
                         "time": start,
@@ -290,11 +306,13 @@ if st.session_state.get('sess'):
             for i, c in enumerate(cards):
                 with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No more shifts scheduled for this date.")
-    elif shifts is None:
-        st.warning("Session may have expired. Please log in again via the sidebar.")
+            st.info("No shifts found for this date.")
+    elif shifts is not None:
+        st.info("No shifts found for this date.")
+    else:
+        st.warning("Data fetch failed. Your session may have expired.")
                 
     time.sleep(60)
     st.rerun()
 else:
-    st.info("Please log in using the sidebar to view the volunteer roster.")
+    st.info("Please log in via the sidebar to view the live roster.")
