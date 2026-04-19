@@ -42,19 +42,32 @@ st.markdown("""
     [data-theme="dark"] .shift-card { background-color: #1e2130; color: #ffffff; }
     .shift-time { font-size: 1rem; font-weight: 700; color: #666; margin-bottom: 0.3rem; }
     .shift-name { font-size: 1.4rem; font-weight: 800; margin-bottom: 0.1rem; }
-    .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #888; font-weight: 600; margin-bottom: 1rem; }
+    .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #888; font-weight: 600; margin-bottom: 0.8rem; }
     .status-badge { padding: 0.4rem 0.8rem; border-radius: 20px; font-weight: 700; font-size: 0.75rem; text-transform: uppercase; }
     
     .status-checked-in { border-left-color: #28a745 !important; background-color: rgba(40, 167, 69, 0.08); }
     .status-checked-in .status-badge { background-color: #28a745; color: white; }
-    .status-checked-out { border-left-color: #fd7e14 !important; background-color: rgba(253, 126, 20, 0.08); }
-    .status-checked-out .status-badge { background-color: #fd7e14; color: white; }
+    
+    .status-completed { border-left-color: #8b5cf6 !important; background-color: rgba(139, 92, 246, 0.08); }
+    .status-completed .status-badge { background-color: #8b5cf6; color: white; }
+    
     .status-alert-red { border-left-color: #dc3545 !important; background-color: rgba(220, 53, 69, 0.08); }
     .status-alert-red .status-badge { background-color: #dc3545; color: white; }
+    
+    .status-late { border-left-color: #fd7e14 !important; background-color: rgba(253, 126, 20, 0.08); }
+    .status-late .status-badge { background-color: #fd7e14; color: white; }
+    
     .status-pending { border-left-color: #6c757d !important; background-color: #f8f9fa; }
     .status-pending .status-badge { background-color: #6c757d; color: white; }
+    
     .status-upcoming { border-left-color: #007bff !important; background-color: rgba(0, 123, 255, 0.08); }
     .status-upcoming .status-badge { background-color: #007bff; color: white; }
+    
+    .punch-time {
+        font-size: 0.85rem; color: #a0a6c2; margin-bottom: 1rem; font-weight: 600; 
+        background: rgba(0,0,0,0.1); display: inline-block; padding: 3px 8px; border-radius: 4px;
+        font-family: 'JetBrains Mono', monospace;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -82,37 +95,30 @@ def authenticate_headless(email, password):
             service = Service(ChromeDriverManager().install())
             
         driver = webdriver.Chrome(service=service, options=options)
-        wait = WebDriverWait(driver, 15) # 15 seconds is plenty if the page isn't blocked
+        wait = WebDriverWait(driver, 15) 
         
-        # 1. Load Page
         driver.get(f"{BASE}/volunteer/#/login")
-        time.sleep(4) # Let React render
+        time.sleep(4) 
         
-        # 2. Enter Email
         email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
         email_field.click()
         email_field.clear()
         email_field.send_keys(email)
         
-        # 3. Click Next
         next_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')] | //button[@type='submit']")))
         next_btn.click()
         
-        # 4. Wait for Password Transition
-        time.sleep(3) # Let React animate the transition
+        time.sleep(3) 
         pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
         pass_field.click()
         pass_field.clear()
         pass_field.send_keys(password)
         
-        # 5. Click Log In
         login_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in') or contains(., 'Sign In') or @type='submit']")))
         login_btn.click()
         
-        # 6. Wait for Auth API & Redirect
         time.sleep(8) 
         
-        # Capture Session
         cookies = driver.get_cookies()
         if not cookies or len(cookies) < 2:
             raise Exception("Login clicked, but no session cookies were returned. Are credentials correct?")
@@ -124,12 +130,9 @@ def authenticate_headless(email, password):
 
     except Exception as e:
         st.error(f"Login failed at UI step: {str(e)}")
-        # X-RAY VISUAL DEBUGGER: Grabs a screenshot of exactly what Chrome is seeing
         if driver:
-            try:
-                st.image(driver.get_screenshot_as_png(), caption="Headless Browser Screenshot (What the script saw when it failed)")
-            except:
-                pass
+            try: st.image(driver.get_screenshot_as_png(), caption="Headless Browser Error Snapshot")
+            except: pass
         return None
     finally:
         if driver:
@@ -137,7 +140,7 @@ def authenticate_headless(email, password):
             except: pass
 
 @st.cache_data(ttl=60)
-def get_dashboard_data(_sess):
+def get_dashboard_data(_sess, target_date_str):
     if _sess is None: return None, None
     try:
         headers = {
@@ -148,16 +151,15 @@ def get_dashboard_data(_sess):
         if r.status_code != 200: return None, None
         
         shifts = r.json()
-        now_local = datetime.now(LOCAL_TZ)
-        today = now_local.date()
+        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
         
-        todays_shifts = []
+        target_shifts = []
         uids = set()
         for s in shifts:
             try:
                 sd = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                if sd.date() == today:
-                    todays_shifts.append(s)
+                if sd.date() == target_date:
+                    target_shifts.append(s)
                     for r_role in s.get("roles", []):
                         for u in r_role.get("users", []): uids.add(u["id"])
             except: continue
@@ -172,7 +174,7 @@ def get_dashboard_data(_sess):
             for f in as_completed(futures):
                 uid, data = f.result()
                 service_map[uid] = data
-        return todays_shifts, service_map
+        return target_shifts, service_map
     except Exception as e:
         st.error(f"API Fetch Error: {e}")
         return None, None
@@ -193,7 +195,7 @@ with st.sidebar:
                     st.warning("Please enter your credentials.")
     else:
         st.success("Session Active")
-        if st.button("Refresh Board"): 
+        if st.button("Refresh Data"): 
             st.cache_data.clear()
             st.rerun()
         if st.button("Log Out"): 
@@ -202,10 +204,17 @@ with st.sidebar:
 
 if st.session_state.get('sess'):
     now = datetime.now(LOCAL_TZ)
-    st.title(f"Refuge Roster — {now.strftime('%A, %b %d')}")
     
-    with st.spinner("Updating board..."):
-        shifts, svc_data = get_dashboard_data(st.session_state.sess)
+    # ─── Date Picker & Header ───
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        target_date = st.date_input("📅 Select Date", value=now.date())
+    with col1:
+        date_label = "Today" if target_date == now.date() else target_date.strftime('%A, %b %d')
+        st.title(f"Refuge Roster — {date_label}")
+    
+    with st.spinner(f"Fetching schedule for {target_date.strftime('%m/%d')}..."):
+        shifts, svc_data = get_dashboard_data(st.session_state.sess, target_date.strftime("%Y-%m-%d"))
     
     if shifts:
         cards = []
@@ -223,19 +232,56 @@ if st.session_state.get('sess'):
                     name = f"{u['firstName']} {u['lastName']}"
                     recs = svc_data.get(uid, []) if svc_data else []
                     rec = next((r for r in recs if r.get('eventShiftId') == s_id and r.get('isActive')), None)
-                    cin, cout = (rec.get('startTimestamp') if rec else None), (rec.get('endTimestamp') if rec else None)
                     
-                    status, css = "Pending", "status-pending"
-                    if cin and cout: status, css = "Checked Out", "status-checked-out"
-                    elif cin:
-                        status, css = ("Missing Clock-Out", "status-alert-red") if now > end + timedelta(minutes=10) else ("Checked In", "status-checked-in")
+                    # ─── Process Clock Times ───
+                    cin_raw = rec.get('startTimestamp') if rec else None
+                    cout_raw = rec.get('endTimestamp') if rec else None
+                    
+                    cin_dt = datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cin_raw else None
+                    cout_dt = datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cout_raw else None
+                    
+                    if cin_dt or cout_dt:
+                        c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
+                        c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
+                        time_display = f"In: {c_in_str}  →  Out: {c_out_str}"
                     else:
-                        if now > start + timedelta(minutes=10): status, css = "Late Check-In", "status-alert-red"
-                        elif now >= start - timedelta(minutes=30): status, css = "Due Soon", "status-upcoming"
+                        time_display = "No punches recorded"
+
+                    # ─── Status & Color Matrix ───
+                    status, css = "Pending", "status-pending"
+                    
+                    if cin_dt and cout_dt:
+                        if cin_dt > start + timedelta(minutes=10):
+                            status, css = "Completed (Late In)", "status-late" # Orange
+                        else:
+                            status, css = "Completed", "status-completed" # Purple
+                            
+                    elif cin_dt and not cout_dt:
+                        if now > end + timedelta(minutes=10):
+                            status, css = "Missing Clock-Out", "status-alert-red"
+                        elif cin_dt > start + timedelta(minutes=10):
+                            status, css = "Checked In (Late)", "status-late" # Orange
+                        else:
+                            status, css = "Checked In", "status-checked-in" # Green
+                            
+                    else: # No check-in data at all
+                        if now > start + timedelta(minutes=10):
+                            status, css = "Missing Check-In", "status-alert-red"
+                        elif now >= start - timedelta(minutes=30):
+                            status, css = "Due Soon", "status-upcoming" # Blue
 
                     cards.append({
                         "time": start,
-                        "html": f'<div class="shift-card {css}"><div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div><div class="shift-name">{name}</div><div class="shift-role">{role_nm}</div><span class="status-badge">{status}</span></div>'
+                        "html": f"""
+                        <div class="shift-card {css}">
+                            <div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div>
+                            <div class="shift-name">{name}</div>
+                            <div class="shift-role">{role_nm}</div>
+                            <div class="punch-time">🕒 {time_display}</div>
+                            <br/>
+                            <span class="status-badge">{status}</span>
+                        </div>
+                        """
                     })
         
         if cards:
@@ -244,11 +290,11 @@ if st.session_state.get('sess'):
             for i, c in enumerate(cards):
                 with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No more shifts scheduled for today.")
+            st.info("No more shifts scheduled for this date.")
     elif shifts is None:
         st.warning("Session may have expired. Please log in again via the sidebar.")
                 
     time.sleep(60)
     st.rerun()
 else:
-    st.info("Please log in using the sidebar to view today's volunteer roster.")
+    st.info("Please log in using the sidebar to view the volunteer roster.")
