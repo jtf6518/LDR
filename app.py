@@ -323,7 +323,7 @@ def find_punch_for_shift(user_punches, shift, t_date):
 @st.cache_data(ttl=CACHE_TTL)
 def get_dashboard_data(_auth_dict, target_date_obj):
     if not _auth_dict:
-        return None, None
+        return None, None, None
 
     # 1. Shifts (with users embedded) — primary roster source
     shifts_params = {
@@ -337,9 +337,9 @@ def get_dashboard_data(_auth_dict, target_date_obj):
                           shifts_params)
 
     if isinstance(s_raw, str):
-        return s_raw, None
+        return s_raw, None, None
     if not s_raw:
-        return "ERR_EMPTY", None
+        return "ERR_EMPTY", None, None
 
     shift_defs = {s['id']: s for s in s_raw}
 
@@ -423,18 +423,49 @@ def get_dashboard_data(_auth_dict, target_date_obj):
                 })
 
     # 3. Fetch service time for every user on today's roster (parallel)
+    # Try BOTH the org-scoped and event-scoped endpoints — they may return
+    # different subsets (e.g. in-progress check-ins might only appear in one).
     punch_map = {}
+    source_map = {}  # uid -> {"org": count, "event": count} for debug
 
     def fetch_punches(uid):
-        p_raw = safe_get_json(_auth_dict,
-                              f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime")
-        return uid, p_raw if isinstance(p_raw, list) else []
+        org_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
+        evt_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users/{uid}/serviceTime"
+
+        org_raw = safe_get_json(_auth_dict, org_url)
+        evt_raw = safe_get_json(_auth_dict, evt_url)
+
+        org_list = org_raw if isinstance(org_raw, list) else []
+        evt_list = evt_raw if isinstance(evt_raw, list) else []
+
+        # Merge on record id, preferring whichever has startTimestamp populated
+        merged = {}
+        for rec in org_list:
+            rid = rec.get('id') or f"org-{rec.get('startTimestamp')}-{rec.get('eventShiftId')}"
+            rec['_source'] = 'org'
+            merged[rid] = rec
+        for rec in evt_list:
+            rid = rec.get('id') or f"evt-{rec.get('startTimestamp')}-{rec.get('eventShiftId')}"
+            if rid in merged:
+                # Prefer the version with more data
+                existing = merged[rid]
+                if not existing.get('startTimestamp') and rec.get('startTimestamp'):
+                    rec['_source'] = 'event (preferred)'
+                    merged[rid] = rec
+                else:
+                    existing['_source'] = existing.get('_source', 'org') + '+event'
+            else:
+                rec['_source'] = 'event'
+                merged[rid] = rec
+
+        return uid, list(merged.values()), {"org": len(org_list), "event": len(evt_list)}
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(fetch_punches, uid) for uid in uids]
         for f in as_completed(futures):
-            uid, plist = f.result()
+            uid, plist, counts = f.result()
             punch_map[uid] = plist
+            source_map[uid] = counts
 
     # 4. Clean up names
     final_roster = []
@@ -446,7 +477,7 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         p['fname'], p['lname'] = fname, lname
         final_roster.append(p)
 
-    return final_roster, punch_map
+    return final_roster, punch_map, source_map
 
 
 # ─── App UI ───────────────────────────────────────────────────────────────────
@@ -473,6 +504,13 @@ with st.sidebar:
             st.rerun()
         st.caption(f"Auto-refreshes every {REFRESH_SECS}s")
 
+        st.divider()
+        st.session_state.debug_mode = st.checkbox(
+            "🔬 Debug mode",
+            value=st.session_state.get("debug_mode", False),
+            help="Shows raw serviceTime API responses for in-progress shifts so we can see what the API is actually returning."
+        )
+
 if st.session_state.auth_data:
     now = datetime.now(LOCAL_TZ)
     t_date = now.date()
@@ -491,9 +529,64 @@ if st.session_state.auth_data:
                 st.error(f"API Error: {data[0]}")
                 st.stop()
 
-        roster, punches = data
+        roster, punches, sources = data
 
     if roster:
+        # ── Debug panel (if enabled) — show raw serviceTime for users on in-progress shifts ──
+        if st.session_state.get("debug_mode"):
+            import json as _json
+            in_progress = [v for v in roster
+                           if v['start'] - timedelta(minutes=30) <= now <= v['end'] + timedelta(minutes=30)]
+
+            st.markdown('<div class="section-header">🔬 Debug — Current / In-Progress Shifts</div>',
+                        unsafe_allow_html=True)
+
+            if not in_progress:
+                st.info("No shifts currently in progress (±30 min window).")
+            else:
+                st.caption(
+                    "For each user whose shift is currently active, this shows what "
+                    "/serviceTime is returning. If a user is checked in via the Bloomerang app "
+                    "but nothing shows here, the API likely isn't exposing active check-ins "
+                    "to volunteer-level accounts."
+                )
+
+                for v in in_progress:
+                    user_p = punches.get(v['uid'], [])
+                    # Only show records for today
+                    todays = []
+                    for p in user_p:
+                        st_ts = p.get('startTimestamp')
+                        if st_ts:
+                            try:
+                                dt = datetime.fromisoformat(st_ts.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                                if dt.date() == t_date:
+                                    todays.append(p)
+                            except Exception:
+                                pass
+                        elif not p.get('endTimestamp') and p.get('dayDate', '').startswith(t_date.isoformat()):
+                            # manager-fix entry for today
+                            todays.append(p)
+
+                    src = sources.get(v['uid'], {})
+                    label = (f"{v['fname']} {v['lname']} · "
+                             f"shift {v['start'].strftime('%I:%M %p')} (sid={v['sid']}, uid={v['uid']})  "
+                             f"— org endpoint: {src.get('org', 0)} records, "
+                             f"event endpoint: {src.get('event', 0)} records, "
+                             f"today: {len(todays)}")
+
+                    with st.expander(label):
+                        if todays:
+                            st.json(todays)
+                        else:
+                            st.warning(
+                                "No serviceTime records returned for today from either endpoint. "
+                                "If this user IS clocked in right now, the check-in is not visible "
+                                "to this API token. Likely causes: (1) check-ins only appear after "
+                                "clock-out, or (2) active presence is on /presence which returns 403 "
+                                "for volunteer-level accounts."
+                            )
+
         # ── Assemble cards + status, collect counts ──
         cards = []
         counts = {"On Shift": 0, "Completed": 0, "Starting Soon": 0,
