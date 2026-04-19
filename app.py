@@ -101,7 +101,12 @@ def authenticate_headless(email, password):
         wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in')]"))).click()
         
         time.sleep(7)
-        for c in driver.get_cookies(): sess.cookies.set(c['name'], c['value'])
+        # Check if login was successful by looking for cookies
+        cookies = driver.get_cookies()
+        if not cookies:
+            return None
+            
+        for c in cookies: sess.cookies.set(c['name'], c['value'])
         return sess
     except Exception as e:
         st.error(f"Login failed: {e}")
@@ -109,94 +114,99 @@ def authenticate_headless(email, password):
     finally:
         if driver: driver.quit()
 
+def safe_get_json(sess, url, params=None):
+    """Safely fetch JSON to prevent DecodeErrors from HTML error pages."""
+    try:
+        r = sess.get(url, params=params, headers={'Accept': 'application/json', 'Referer': f'{BASE}/volunteer/'}, timeout=15)
+        if r.status_code == 401:
+            return "AUTH_EXPIRED"
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except:
+        return None
+
 @st.cache_data(ttl=60)
 def get_dashboard_data(_sess, target_date_obj):
     if not _sess: return None, None
-    headers = {'Accept': 'application/json', 'Referer': f'{BASE}/volunteer/'}
     
-    try:
-        # 1. Fetch data
-        s_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true"}, headers=headers).json()
-        shift_defs = {s['id']: s for s in s_raw}
+    # 1. Fetch data safely
+    s_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", {"includeShiftRoles": "true"})
+    if s_raw == "AUTH_EXPIRED": return "AUTH_EXPIRED", None
+    if not s_raw: return None, None
+    
+    shift_defs = {s['id']: s for s in s_raw}
+    
+    enrollments = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments") or []
+    attendance = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance") or []
+    
+    raw_people = []
+    uids = set()
+    
+    # 2. Extract uniquely identified people with assignments
+    def process_person(item):
+        uid = item.get('userId')
+        sid = item.get('eventShiftId')
+        if not uid or not sid: return
         
-        enrollments = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments", headers=headers).json()
-        attendance = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance", headers=headers).json()
+        s_def = shift_defs.get(sid)
+        if not s_def: return
         
-        raw_people = []
-        uids = set()
+        s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+        if s_start.date() != target_date_obj: return
         
-        # 2. Extract uniquely identified people with assignments
-        def process_person(item):
-            uid = item.get('userId')
-            sid = item.get('eventShiftId')
-            if not uid or not sid: return
-            
-            s_def = shift_defs.get(sid)
-            if not s_def: return
-            
-            s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            if s_start.date() != target_date_obj: return
-            
-            # Find Role Name
-            rid = item.get('eventRoleId')
-            r_name = "Volunteer"
-            for r in s_def.get('roles', []):
-                if r.get('id') == rid:
-                    r_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
-                    break
-            
-            # Try to get a name
-            fn = item.get('firstName', '').strip()
-            ln = item.get('lastName', '').strip()
-            
-            raw_people.append({
-                'uid': uid, 'sid': sid, 'fname': fn, 'lname': ln, 'role': r_name,
-                'start': s_start, 'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            })
-            uids.add(uid)
+        # Find Role Name
+        rid = item.get('eventRoleId')
+        r_name = "Volunteer"
+        for r in s_def.get('roles', []):
+            if r.get('id') == rid:
+                r_name = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                break
+        
+        raw_people.append({
+            'uid': uid, 'sid': sid, 'fname': item.get('firstName', '').strip(), 
+            'lname': item.get('lastName', '').strip(), 'role': r_name,
+            'start': s_start, 'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+        })
+        uids.add(uid)
 
-        for e in enrollments: process_person(e)
-        for a in attendance: process_person(a)
+    for e in enrollments: process_person(e)
+    for a in attendance: process_person(a)
 
-        # 3. Enrichment (Fetch Profiles & Punches)
-        punch_map = {}
-        profile_map = {}
+    # 3. Enrichment (Fetch Profiles & Punches)
+    punch_map = {}
+    profile_map = {}
 
-        def fetch_meta(uid):
-            p_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime", headers=headers).json()
-            prof_raw = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}", headers=headers).json()
-            return uid, p_raw, prof_raw
+    def fetch_meta(uid):
+        p_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime")
+        prof_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}")
+        return uid, p_raw or [], prof_raw or {}
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = [pool.submit(fetch_meta, uid) for uid in uids]
-            for f in as_completed(futures):
-                uid, p_list, prof = f.result()
-                punch_map[uid] = p_list
-                profile_map[uid] = prof
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(fetch_meta, uid) for uid in uids]
+        for f in as_completed(futures):
+            uid, p_list, prof = f.result()
+            punch_map[uid] = p_list
+            profile_map[uid] = prof
 
-        # 4. Filter & Clean
-        final_roster = []
-        seen = set()
-        for p in raw_people:
-            # Use Profile name if enrollment name is missing
-            prof = profile_map.get(p['uid'], {})
-            fname = p['fname'] if p['fname'] else prof.get('firstName', '')
-            lname = p['lname'] if p['lname'] else prof.get('lastName', '')
-            
-            # ABSOLUTELY DISCARD if no name found - this kills the "No ID" cards
-            if not fname or fname.lower() in ["none", "volunteer"]: continue
-            
-            key = f"{p['sid']}-{p['uid']}"
-            if key in seen: continue
-            
-            p['fname'], p['lname'] = fname, lname
-            final_roster.append(p)
-            seen.add(key)
-            
-        return final_roster, punch_map
-    except Exception as e:
-        st.error(f"Sync error: {e}")
-        return None, None
+    # 4. Filter & Clean
+    final_roster = []
+    seen = set()
+    for p in raw_people:
+        prof = profile_map.get(p['uid'], {})
+        fname = p['fname'] if p['fname'] else prof.get('firstName', '')
+        lname = p['lname'] if p['lname'] else prof.get('lastName', '')
+        
+        if not fname or fname.lower() in ["none", "volunteer"]: continue
+        
+        key = f"{p['sid']}-{p['uid']}"
+        if key in seen: continue
+        
+        p['fname'], p['lname'] = fname, lname
+        final_roster.append(p)
+        seen.add(key)
+        
+    return final_roster, punch_map
 
 # ─── App UI ───
 if 'sess' not in st.session_state: st.session_state.sess = None
@@ -222,18 +232,22 @@ if st.session_state.sess:
     with c1: st.title(f"Roster: {t_date.strftime('%A, %b %d')}")
     
     with st.spinner("Syncing Bloomerang..."):
-        roster, punches = get_dashboard_data(st.session_state.sess, t_date)
+        data = get_dashboard_data(st.session_state.sess, t_date)
+        
+        if data == "AUTH_EXPIRED":
+            st.session_state.sess = None
+            st.error("Session Expired. Please log in again.")
+            st.stop()
+            
+        roster, punches = data
     
     if roster:
         cards = []
         for v in roster:
             fullName = f"{v['fname']} {v['lname']}".strip()
-            
-            # Punch Matching
             user_p = punches.get(v['uid'], [])
             my_punch = next((p for p in user_p if p.get('eventShiftId') == v['sid']), None)
             
-            # Fallback: check date overlap if shift ID didn't match
             if not my_punch:
                 for p in user_p:
                     if p.get('startTimestamp'):
@@ -242,7 +256,6 @@ if st.session_state.sess:
 
             cin = datetime.fromisoformat(my_punch['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('startTimestamp') else None
             cout = datetime.fromisoformat(my_punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if my_punch and my_punch.get('endTimestamp') else None
-            
             p_str = f"In: {cin.strftime('%I:%M%p') if cin else '--'} → Out: {cout.strftime('%I:%M%p') if cout else '--'}"
             
             status, css = "Scheduled", "status-pending"
