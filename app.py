@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import time
-import pandas as pd
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -76,29 +76,38 @@ def authenticate_headless(email, password):
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     
+    # Cloud specific: try to find the chromium binary installed via packages.txt
+    if os.path.exists("/usr/bin/chromium"):
+        options.binary_location = "/usr/bin/chromium"
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        options.binary_location = "/usr/bin/chromium-browser"
+
     sess = requests.Session()
     
     try:
-        # Use ChromeDriverManager but handle server pathing
-        service = Service(ChromeDriverManager().install())
+        # On Streamlit Cloud, we often need to point directly to the installed driver
+        driver_path = "/usr/bin/chromedriver"
+        if os.path.exists(driver_path):
+            service = Service(driver_path)
+        else:
+            service = Service(ChromeDriverManager().install())
+            
         driver = webdriver.Chrome(service=service, options=options)
         
         driver.get(f"{BASE}/volunteer/#/login")
         wait = WebDriverWait(driver, 30)
         
         # Look for Cognito login fields
-        # AWS Cognito often uses "username" and "password" as names
         email_el = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @name='username' or @id='email']")))
         pass_el = driver.find_element(By.XPATH, "//input[@type='password' or @name='password' or @id='password']")
         
         email_el.send_keys(email)
         pass_el.send_keys(password)
         
-        # Click the Sign In button
         login_btn = driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Sign In')]")
         login_btn.click()
         
-        # Wait for redirect to the internal dashboard
+        # Wait for redirect to dashboard
         wait.until(EC.url_contains("dashboard"))
         time.sleep(3)
         
@@ -166,7 +175,9 @@ with st.sidebar:
                         if st.session_state.sess: st.rerun()
     else:
         st.success("Authorized")
-        if st.button("Manual Refresh"): st.cache_data.clear()
+        if st.button("Manual Refresh"): 
+            st.cache_data.clear()
+            st.rerun()
         if st.button("Log Out"): 
             st.session_state.sess = None
             st.rerun()
@@ -226,7 +237,6 @@ if st.session_state.get('sess'):
         
         if cards:
             cards.sort(key=lambda x: x['time'])
-            # Responsive column logic
             cols = st.columns(4)
             for i, c in enumerate(cards):
                 with cols[i % 4]:
