@@ -80,48 +80,48 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        wait = WebDriverWait(driver, 40)
+        wait = WebDriverWait(driver, 30)
         time.sleep(5) 
-        
-        # Check for iframe (Cognito common behavior)
+
+        # Step 1: Email Screen
+        # Switch to iframe if present
         if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
             driver.switch_to.frame(0)
             
-        # Selectors updated for Bloomerang's AWS Cognito implementation
-        email_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[contains(@id, 'username') or contains(@name, 'username') or @type='email']")))
-        pass_field = driver.find_element(By.XPATH, "//input[contains(@id, 'password') or @type='password']")
-        
+        email_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or contains(@name, 'username')]")))
         email_field.send_keys(email)
+        
+        # Click "Next" or "Continue" button
+        next_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Next') or contains(text(), 'Continue') or @type='submit']")
+        next_btn.click()
+        
+        # Step 2: Password Screen (Wait for transition)
+        time.sleep(4)
+        pass_field = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password' or contains(@name, 'password')]")))
         pass_field.send_keys(password)
         
-        # Click login button
-        login_btn = driver.find_element(By.XPATH, "//button[contains(@name, 'signInSubmitButton') or contains(text(), 'Sign In') or @type='submit']")
+        # Click final "Sign In" or "Login" button
+        login_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Sign In') or contains(text(), 'Log In') or @type='submit']")
         login_btn.click()
         
-        # Wait for the login process to start
+        # Step 3: Wait for session established
         time.sleep(10)
         
-        # Instead of waiting for a specific dashboard element (which is causing the TimeoutException),
-        # we check for the URL change and attempt cookie capture.
-        for _ in range(5):
+        # Capture cookies
+        captured = False
+        for _ in range(3):
             cookies = driver.get_cookies()
-            # Look for typical auth cookie names (Cognito or Bloomerang specific)
-            if any("session" in c['name'].lower() or "token" in c['name'].lower() or "cognito" in c['name'].lower() for c in cookies):
+            if cookies:
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
-                return sess
+                captured = True
+                break
             time.sleep(3)
             
-        # Last resort: capture whatever is there
-        cookies = driver.get_cookies()
-        if cookies:
-            for cookie in cookies:
-                sess.cookies.set(cookie['name'], cookie['value'])
-            return sess
-            
-        return None
+        return sess if captured else None
+        
     except Exception as e:
-        st.error(f"Browser Auth Error: {str(e)}")
+        st.error(f"Auth Flow interrupted: {str(e)}")
         return None
     finally:
         if driver:
@@ -132,7 +132,6 @@ def authenticate_headless(email, password):
 def get_dashboard_data(_sess):
     if _sess is None: return None, None
     try:
-        # Include a User-Agent to look less like a script
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         
@@ -178,10 +177,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in... Please wait about 30-45 seconds."):
+                    with st.spinner("Executing multi-step login..."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication timed out or failed. Please check credentials.")
+                        else: st.error("Authentication failed. Please verify credentials.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
@@ -239,7 +238,7 @@ if st.session_state.get('sess'):
         else:
             st.info("No more shifts scheduled for today.")
     elif shifts is None:
-        st.warning("Session may have expired or data could not be retrieved. Please log in again.")
+        st.warning("Session may have expired. Please log in again.")
                 
     time.sleep(60)
     st.rerun()
