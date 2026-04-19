@@ -81,7 +81,6 @@ def authenticate_headless(email, password):
     
     if os.path.exists("/usr/bin/chromium"): options.binary_location = "/usr/bin/chromium"
     
-    sess = requests.Session()
     driver = None
     try:
         service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service(ChromeDriverManager().install())
@@ -91,57 +90,82 @@ def authenticate_headless(email, password):
         driver.get(f"{BASE}/volunteer/#/login")
         time.sleep(3)
         
-        email_f = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']")))
-        email_f.send_keys(email)
+        # Perform Login steps
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @type='text']"))).send_keys(email)
         wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'NEXT', 'next'), 'next')]"))).click()
         
         time.sleep(2)
-        pass_f = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']")))
-        pass_f.send_keys(password)
+        wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='password']"))).send_keys(password)
         wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(translate(., 'LOG IN', 'log in'), 'log in')]"))).click()
         
-        time.sleep(7)
-        # Check if login was successful by looking for cookies
-        cookies = driver.get_cookies()
-        if not cookies:
-            return None
+        # CRITICAL: Wait for the dashboard to successfully load before grabbing session data
+        try:
+            wait.until(EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'My Shifts') or contains(text(), 'Welcome')]")))
+            time.sleep(2) # Give a short buffer for the browser to write to localStorage
+        except:
+            raise Exception("Timeout waiting for dashboard to load. Incorrect password or blocked by CAPTCHA.")
             
-        for c in cookies: sess.cookies.set(c['name'], c['value'])
-        return sess
+        sess = requests.Session()
+        for c in driver.get_cookies(): 
+            sess.cookies.set(c['name'], c['value'])
+            
+        # Extract AWS Amplify Bearer token from localStorage
+        token = driver.execute_script("""
+            for (let i = 0; i < localStorage.length; i++) {
+                let key = localStorage.key(i);
+                if (key.includes('idToken') || key.includes('accessToken')) {
+                    return localStorage.getItem(key);
+                }
+            }
+            return null;
+        """)
+        
+        return {"sess": sess, "token": token}
     except Exception as e:
         st.error(f"Login failed: {e}")
         return None
     finally:
         if driver: driver.quit()
 
-def safe_get_json(sess, url, params=None):
-    """Safely fetch JSON to prevent DecodeErrors from HTML error pages."""
+def safe_get_json(auth_dict, url, params=None):
+    """Safely fetch JSON and report explicit API errors."""
+    sess = auth_dict['sess']
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': f'{BASE}/volunteer/',
+    }
+    if auth_dict.get('token'):
+        headers['Authorization'] = f"Bearer {auth_dict['token']}"
+        
     try:
-        r = sess.get(url, params=params, headers={'Accept': 'application/json', 'Referer': f'{BASE}/volunteer/'}, timeout=15)
-        if r.status_code == 401:
-            return "AUTH_EXPIRED"
-        if r.status_code != 200:
-            return None
+        r = sess.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code == 401: return "AUTH_EXPIRED"
+        if r.status_code != 200: return f"ERR_{r.status_code}: {r.text[:150]}"
         return r.json()
-    except:
-        return None
+    except Exception as e:
+        return f"ERR_REQ: {str(e)}"
 
 @st.cache_data(ttl=60)
-def get_dashboard_data(_sess, target_date_obj):
-    if not _sess: return None, None
+def get_dashboard_data(_auth_dict, target_date_obj):
+    if not _auth_dict: return None, None
     
     # 1. Fetch data safely
-    s_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", {"includeShiftRoles": "true"})
-    if s_raw == "AUTH_EXPIRED": return "AUTH_EXPIRED", None
-    if not s_raw: return None, None
+    s_raw = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", {"includeShiftRoles": "true"})
+    if isinstance(s_raw, str): return s_raw, None # Passes error string back to UI
+    if not s_raw: return "ERR_EMPTY", None
     
     shift_defs = {s['id']: s for s in s_raw}
     
-    enrollments = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments") or []
-    attendance = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance") or []
+    enrollments = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments")
+    if isinstance(enrollments, str): enrollments = []
+    
+    attendance = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/attendance")
+    if isinstance(attendance, str): attendance = []
     
     raw_people = []
     uids = set()
+    seen_keys = set()
     
     # 2. Extract uniquely identified people with assignments
     def process_person(item):
@@ -155,6 +179,9 @@ def get_dashboard_data(_sess, target_date_obj):
         s_start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
         if s_start.date() != target_date_obj: return
         
+        key = f"{sid}-{uid}"
+        if key in seen_keys: return
+        
         # Find Role Name
         rid = item.get('eventRoleId')
         r_name = "Volunteer"
@@ -164,23 +191,34 @@ def get_dashboard_data(_sess, target_date_obj):
                 break
         
         raw_people.append({
-            'uid': uid, 'sid': sid, 'fname': item.get('firstName', '').strip(), 
-            'lname': item.get('lastName', '').strip(), 'role': r_name,
-            'start': s_start, 'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            'uid': uid, 'sid': sid, 
+            'fname': item.get('firstName', '').strip(), 
+            'lname': item.get('lastName', '').strip(), 
+            'role': r_name,
+            'start': s_start, 
+            'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
         })
         uids.add(uid)
+        seen_keys.add(key)
 
     for e in enrollments: process_person(e)
     for a in attendance: process_person(a)
+    for sid, sdef in shift_defs.items():
+        for role in sdef.get('roles', []):
+            for user in role.get('users', []):
+                process_person({'userId': user.get('id'), 'eventShiftId': sid, 'firstName': user.get('firstName'), 'lastName': user.get('lastName'), 'eventRoleId': role.get('id')})
 
     # 3. Enrichment (Fetch Profiles & Punches)
     punch_map = {}
     profile_map = {}
 
     def fetch_meta(uid):
-        p_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime")
-        prof_raw = safe_get_json(_sess, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}")
-        return uid, p_raw or [], prof_raw or {}
+        p_raw = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime")
+        prof_raw = safe_get_json(_auth_dict, f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}")
+        
+        plist = p_raw if isinstance(p_raw, list) else []
+        pdict = prof_raw if isinstance(prof_raw, dict) else {}
+        return uid, plist, pdict
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(fetch_meta, uid) for uid in uids]
@@ -191,54 +229,58 @@ def get_dashboard_data(_sess, target_date_obj):
 
     # 4. Filter & Clean
     final_roster = []
-    seen = set()
     for p in raw_people:
         prof = profile_map.get(p['uid'], {})
         fname = p['fname'] if p['fname'] else prof.get('firstName', '')
         lname = p['lname'] if p['lname'] else prof.get('lastName', '')
         
-        if not fname or fname.lower() in ["none", "volunteer"]: continue
-        
-        key = f"{p['sid']}-{p['uid']}"
-        if key in seen: continue
-        
+        # If the name is STILL completely missing, label them "Unknown" instead of dropping them
+        # so you can actually see that a shift exists and was pulled
+        if not fname or fname.lower() in ["none", "volunteer"]: 
+            fname = "Unknown"
+            lname = f"(ID: {p['uid']})"
+            
         p['fname'], p['lname'] = fname, lname
         final_roster.append(p)
-        seen.add(key)
         
     return final_roster, punch_map
 
 # ─── App UI ───
-if 'sess' not in st.session_state: st.session_state.sess = None
+if 'auth_data' not in st.session_state: 
+    st.session_state.auth_data = None
 
 with st.sidebar:
     st.title("🐾 Staff Access")
-    if st.session_state.sess is None:
+    if st.session_state.auth_data is None:
         with st.form("auth"):
             u = st.text_input("Email")
             p = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
-                st.session_state.sess = authenticate_headless(u, p)
-                if st.session_state.sess: st.rerun()
+                st.session_state.auth_data = authenticate_headless(u, p)
+                if st.session_state.auth_data: st.rerun()
     else:
         st.success("Connected")
         if st.button("Refresh Board"): st.cache_data.clear(); st.rerun()
-        if st.button("Logout"): st.session_state.sess = None; st.rerun()
+        if st.button("Logout"): st.session_state.auth_data = None; st.rerun()
 
-if st.session_state.sess:
+if st.session_state.auth_data:
     now = datetime.now(LOCAL_TZ)
     c1, c2 = st.columns([3, 1])
     with c2: t_date = st.date_input("Board Date", value=now.date())
     with c1: st.title(f"Roster: {t_date.strftime('%A, %b %d')}")
     
     with st.spinner("Syncing Bloomerang..."):
-        data = get_dashboard_data(st.session_state.sess, t_date)
+        data = get_dashboard_data(st.session_state.auth_data, t_date)
         
-        if data == "AUTH_EXPIRED":
-            st.session_state.sess = None
-            st.error("Session Expired. Please log in again.")
-            st.stop()
-            
+        if isinstance(data[0], str):
+            if data[0] == "AUTH_EXPIRED":
+                st.session_state.auth_data = None
+                st.error("Session Expired. Please log in again.")
+                st.stop()
+            else:
+                st.error(f"Bloomerang API Connection Error: {data[0]}")
+                st.stop()
+                
         roster, punches = data
     
     if roster:
@@ -283,7 +325,7 @@ if st.session_state.sess:
         for i, card in enumerate(cards):
             with cols[i % 4]: st.markdown(card['html'], unsafe_allow_html=True)
     else:
-        st.info(f"No volunteers confirmed for {t_date.strftime('%m/%d')}.")
+        st.info(f"No volunteers scheduled for {t_date.strftime('%m/%d')}.")
     
     time.sleep(60); st.rerun()
 else:
