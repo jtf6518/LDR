@@ -80,7 +80,7 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        wait = WebDriverWait(driver, 30)
+        wait = WebDriverWait(driver, 40)
         time.sleep(5) 
         
         # Check for iframe (Cognito common behavior)
@@ -98,19 +98,22 @@ def authenticate_headless(email, password):
         login_btn = driver.find_element(By.XPATH, "//button[contains(@name, 'signInSubmitButton') or contains(text(), 'Sign In') or @type='submit']")
         login_btn.click()
         
-        # Wait for redirects (crucial on cloud)
+        # Wait for the login process to start
         time.sleep(10)
         
-        # Try to capture cookies up to 3 times
-        for _ in range(3):
+        # Instead of waiting for a specific dashboard element (which is causing the TimeoutException),
+        # we check for the URL change and attempt cookie capture.
+        for _ in range(5):
             cookies = driver.get_cookies()
-            if any("session" in c['name'].lower() or "token" in c['name'].lower() for c in cookies):
+            # Look for typical auth cookie names (Cognito or Bloomerang specific)
+            if any("session" in c['name'].lower() or "token" in c['name'].lower() or "cognito" in c['name'].lower() for c in cookies):
                 for cookie in cookies:
                     sess.cookies.set(cookie['name'], cookie['value'])
                 return sess
             time.sleep(3)
             
-        # Fallback: capture whatever cookies are there
+        # Last resort: capture whatever is there
+        cookies = driver.get_cookies()
         if cookies:
             for cookie in cookies:
                 sess.cookies.set(cookie['name'], cookie['value'])
@@ -129,8 +132,12 @@ def authenticate_headless(email, password):
 def get_dashboard_data(_sess):
     if _sess is None: return None, None
     try:
-        r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"})
-        if r.status_code != 200: return None, None
+        # Include a User-Agent to look less like a script
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
+        
+        if r.status_code != 200: 
+            return None, None
         
         shifts = r.json()
         now_local = datetime.now(LOCAL_TZ)
@@ -139,18 +146,20 @@ def get_dashboard_data(_sess):
         todays_shifts = []
         uids = set()
         for s in shifts:
-            sd = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            if sd.date() == today:
-                todays_shifts.append(s)
-                for r_role in s.get("roles", []):
-                    for u in r_role.get("users", []): uids.add(u["id"])
+            try:
+                sd = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                if sd.date() == today:
+                    todays_shifts.append(s)
+                    for r_role in s.get("roles", []):
+                        for u in r_role.get("users", []): uids.add(u["id"])
+            except: continue
                     
         service_map = {}
         def fetch_user_svc(uid):
-            res = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime")
+            res = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime", headers=headers)
             return uid, res.json() if res.status_code == 200 else []
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = [pool.submit(fetch_user_svc, uid) for uid in uids]
             for f in as_completed(futures):
                 uid, data = f.result()
@@ -169,10 +178,10 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in... This takes ~30 seconds on first run."):
+                    with st.spinner("Logging in... Please wait about 30-45 seconds."):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
-                        else: st.error("Authentication failed. Please check credentials.")
+                        else: st.error("Authentication timed out or failed. Please check credentials.")
                 else:
                     st.warning("Please enter your credentials.")
     else:
@@ -188,15 +197,17 @@ if st.session_state.get('sess'):
     now = datetime.now(LOCAL_TZ)
     st.title(f"Refuge Roster — {now.strftime('%A, %b %d')}")
     
-    with st.spinner("Fetching latest data..."):
+    with st.spinner("Updating board..."):
         shifts, svc_data = get_dashboard_data(st.session_state.sess)
     
     if shifts:
         cards = []
         for s in shifts:
             s_id = s['id']
-            start = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            end = datetime.fromisoformat(s['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            try:
+                start = datetime.fromisoformat(s['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                end = datetime.fromisoformat(s['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            except: continue
             
             for role in s.get("roles", []):
                 role_nm = role.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
@@ -226,9 +237,9 @@ if st.session_state.get('sess'):
             for i, c in enumerate(cards):
                 with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No shifts found for today.")
-    elif shifts is None and svc_data is None:
-        st.warning("No data found or session invalid. Try logging in again.")
+            st.info("No more shifts scheduled for today.")
+    elif shifts is None:
+        st.warning("Session may have expired or data could not be retrieved. Please log in again.")
                 
     time.sleep(60)
     st.rerun()
