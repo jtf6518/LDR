@@ -79,15 +79,16 @@ def authenticate_headless(email, password):
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(f"{BASE}/volunteer/#/login")
         
-        # Longer wait for the initial page and possible iframes
         wait = WebDriverWait(driver, 45)
         
-        # HANDLE IFRAME: Some Bloomerang/Cognito setups wrap the login form
-        time.sleep(5) # Allow JS to settle
+        # Wait for page to settle
+        time.sleep(6) 
+        
+        # Handle potential iframes
         if len(driver.find_elements(By.TAG_NAME, "iframe")) > 0:
             driver.switch_to.frame(0)
             
-        # Try to find login fields with expanded selectors
+        # Locate fields
         email_el = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@type='email' or @name='username' or @id='email' or @id='username']")))
         pass_el = driver.find_element(By.XPATH, "//input[@type='password' or @name='password' or @id='password']")
         
@@ -97,21 +98,22 @@ def authenticate_headless(email, password):
         login_btn = driver.find_element(By.XPATH, "//button[@type='submit' or contains(text(), 'Sign In') or contains(text(), 'Log In')]")
         login_btn.click()
         
-        # Switch back to main content if we were in a frame
-        driver.switch_to.default_content()
+        # Wait for either a URL change or the dashboard to appear
+        # We increase the sleep here because Cognito redirects are multi-step
+        time.sleep(8) 
         
-        # Wait for redirect to dashboard
-        wait.until(EC.url_contains("dashboard"))
-        time.sleep(3)
-        
-        for cookie in driver.get_cookies():
+        # Capture cookies safely
+        cookies = driver.get_cookies()
+        if not cookies:
+            st.error("Login failed: No cookies captured. Check credentials or site accessibility.")
+            return None
+
+        for cookie in cookies:
             sess.cookies.set(cookie['name'], cookie['value'])
             
         return sess
     except Exception as e:
         st.error(f"Login failed: {str(e)}")
-        # Optional: Save screenshot to debug if still failing
-        # driver.save_screenshot("login_error.png")
         return None
     finally:
         if driver:
@@ -121,8 +123,13 @@ def authenticate_headless(email, password):
 @st.cache_data(ttl=60)
 def get_dashboard_data(_sess):
     try:
+        # Check if session is valid
         r = _sess.get(f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts", params={"includeShiftRoles": "true", "includeShiftUsers": "true"})
-        if r.status_code != 200: return None, None
+        if r.status_code == 401:
+            st.warning("Session expired. Please log in again.")
+            return None, None
+        if r.status_code != 200: 
+            return None, None
         
         shifts = r.json()
         now_local = datetime.now(LOCAL_TZ)
@@ -161,7 +168,7 @@ with st.sidebar:
             user_pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 if user_email and user_pw:
-                    with st.spinner("Logging in... This may take up to 30 seconds"):
+                    with st.spinner("Logging in... This may take up to 45 seconds"):
                         st.session_state.sess = authenticate_headless(user_email, user_pw)
                         if st.session_state.sess: st.rerun()
                 else:
@@ -217,9 +224,9 @@ if st.session_state.get('sess'):
             for i, c in enumerate(cards):
                 with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
         else:
-            st.info("No more shifts scheduled for today.")
-    else:
-        st.info("No shifts found for today.")
+            st.info("No shifts found for today.")
+    elif shifts is None and svc_data is None:
+        st.warning("Could not load data. Session might be invalid.")
                 
     time.sleep(60)
     st.rerun()
