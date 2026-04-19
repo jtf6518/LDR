@@ -142,57 +142,75 @@ def get_dashboard_data(_sess, target_date_obj):
             'Referer': f'{BASE}/volunteer/',
         }
         
-        # Step 1: Get ALL Shifts for this event (the API usually returns a reasonable chunk)
+        # Pull shifts - the primary structural source
         shifts_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts"
-        # Force include users here as well as a backup
         r_shifts = _sess.get(shifts_url, params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         if r_shifts.status_code != 200: return None, None, None
         
         all_shifts_raw = r_shifts.json()
         shift_defs = {s['id']: s for s in all_shifts_raw}
         
-        # Step 2: Get Enrollments 
+        # Pull enrollments - the primary assignment source
         enroll_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments"
         r_enroll = _sess.get(enroll_url, headers=headers)
-        if r_enroll.status_code != 200: return None, None, None
+        enrollments = r_enroll.json() if r_enroll.status_code == 200 else []
         
-        enrollments = r_enroll.json()
-        
-        # Step 3: Filter for Target Date (Normalizing all to LOCAL_TZ)
-        active_enrollments = []
+        # Build list of unique users for the target date
+        processed_assignments = []
         uids = set()
         
-        for e in enrollments:
-            s_id = e.get('eventShiftId')
-            s_def = shift_defs.get(s_id)
-            if s_def:
-                # Convert shift start to local time before checking the date
+        # Strategy A: Check Shifts directly for nested users (Best for active/recent shifts)
+        for s_id, s_def in shift_defs.items():
+            try:
                 sd_utc = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00'))
                 sd_local = sd_utc.astimezone(LOCAL_TZ)
                 
                 if sd_local.date() == target_date_obj:
-                    active_enrollments.append(e)
-                    uids.add(e['userId'])
-
-        # Backup Logic: If enrollments was empty, try checking if shift_users has the data
-        if not active_enrollments:
-            for s_id, s_def in shift_defs.items():
-                sd_utc = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00'))
-                sd_local = sd_utc.astimezone(LOCAL_TZ)
-                if sd_local.date() == target_date_obj:
                     for role in s_def.get('roles', []):
                         for user in role.get('users', []):
-                            # Synthetic enrollment record to keep logic consistent
-                            active_enrollments.append({
-                                'eventShiftId': s_id,
-                                'userId': user['id'],
-                                'firstName': user['firstName'],
-                                'lastName': user['lastName'],
-                                'eventRoleId': role['id']
+                            u_id = user['id']
+                            processed_assignments.append({
+                                'shift_id': s_id,
+                                'user_id': u_id,
+                                'first_name': user.get('firstName', 'Volunteer'),
+                                'last_name': user.get('lastName', ''),
+                                'role_name': role.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer"),
+                                'start': sd_local,
+                                'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
                             })
-                            uids.add(user['id'])
-                    
-        # Step 4: Multi-threaded Service Time Fetch
+                            uids.add(u_id)
+            except: continue
+
+        # Strategy B: Cross-reference with enrollments if shift users was thin
+        for e in enrollments:
+            s_id = e.get('eventShiftId')
+            u_id = e.get('userId')
+            # Only add if not already captured and belongs to target shift date
+            if s_id in shift_defs and u_id not in [a['user_id'] for a in processed_assignments if a['shift_id'] == s_id]:
+                s_def = shift_defs[s_id]
+                sd_local = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                if sd_local.date() == target_date_obj:
+                    processed_assignments.append({
+                        'shift_id': s_id,
+                        'user_id': u_id,
+                        'first_name': e.get('firstName', 'Volunteer'),
+                        'last_name': e.get('lastName', ''),
+                        'role_name': "Volunteer", # Will refine below
+                        'start': sd_local,
+                        'end': datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                    })
+                    uids.add(u_id)
+
+        # Refine roles for enrollments
+        for a in processed_assignments:
+            if a['role_name'] == "Volunteer":
+                s_def = shift_defs.get(a['shift_id'])
+                if s_def:
+                    for role in s_def.get('roles', []):
+                        a['role_name'] = role.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                        break
+
+        # Fetch Punches
         service_map = {}
         def fetch_user_svc(uid):
             svc_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
@@ -205,10 +223,10 @@ def get_dashboard_data(_sess, target_date_obj):
                 uid, data = f.result()
                 service_map[uid] = data
                 
-        return shift_defs, active_enrollments, service_map
+        return processed_assignments, service_map
     except Exception as e:
         st.error(f"Data Fetch Error: {e}")
-        return None, None, None
+        return None, None
 
 # ─── App UI ───
 if 'sess' not in st.session_state:
@@ -241,62 +259,50 @@ if st.session_state.sess:
     with col1:
         st.title(f"Refuge Roster — {target_date.strftime('%A, %b %d')}")
     
-    with st.spinner("Updating board..."):
-        shift_defs, enrollments, svc_data = get_dashboard_data(st.session_state.sess, target_date)
+    with st.spinner("Syncing schedule..."):
+        assignments, svc_data = get_dashboard_data(st.session_state.sess, target_date)
     
-    if enrollments:
+    if assignments:
         cards = []
-        for e in enrollments:
-            s_id = e['eventShiftId']
-            u_id = e['userId']
-            s_def = shift_defs.get(s_id)
-            if not s_def: continue
+        for a in assignments:
+            name = f"{a['first_name']} {a['last_name']}"
+            start = a['start']
+            end = a['end']
             
-            name = f"{e.get('firstName', 'Volunteer')} {e.get('lastName', '')}"
+            # Find punch
+            punches = svc_data.get(a['user_id'], [])
+            # Priority 1: Match by shift ID
+            rec = next((p for p in punches if p.get('eventShiftId') == a['shift_id']), None)
             
-            try:
-                start = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                end = datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            except: continue
-            
-            role_nm = "Volunteer"
-            for r in s_def.get("roles", []):
-                if r.get('id') == e.get('eventRoleId'):
-                    role_nm = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
-                    break
+            # Priority 2: Match by Date overlap (for today/yesterday where ID might be missing)
+            if not rec:
+                for p in punches:
+                    try:
+                        p_start = datetime.fromisoformat(p['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                        if p_start.date() == target_date:
+                            rec = p
+                            break
+                    except: continue
 
-            user_punches = svc_data.get(u_id, [])
-            # Search for the punch that matches this specific shift
-            rec = next((p for p in user_punches if p.get('eventShiftId') == s_id), None)
-            
-            cin_raw = rec.get('startTimestamp') if rec else None
-            cout_raw = rec.get('endTimestamp') if rec else None
-            
-            cin_dt = datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cin_raw else None
-            cout_dt = datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ) if cout_raw else None
+            cin_dt = datetime.fromisoformat(rec['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if rec and rec.get('startTimestamp') else None
+            cout_dt = datetime.fromisoformat(rec['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if rec and rec.get('endTimestamp') else None
             
             c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
             c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
             time_display = f"In: {c_in_str} → Out: {c_out_str}"
 
             status, css = "Pending", "status-pending"
-            
             if cin_dt and cout_dt:
-                if cin_dt > start + timedelta(minutes=10):
-                    status, css = "Completed (Late In)", "status-late"
-                else:
-                    status, css = "Completed", "status-completed"
-            elif cin_dt and not cout_dt:
-                if now > end + timedelta(minutes=10):
-                    status, css = "Missing Clock-Out", "status-alert-red"
-                elif cin_dt > start + timedelta(minutes=10):
-                    status, css = "Checked In (Late)", "status-late"
+                status, css = "Completed", "status-completed"
+            elif cin_dt:
+                if now > end + timedelta(minutes=15):
+                    status, css = "Missing Out", "status-alert-red"
                 else:
                     status, css = "Checked In", "status-checked-in"
             else:
-                if now > start + timedelta(minutes=10):
-                    status, css = "Missing Check-In", "status-alert-red"
-                elif now >= start - timedelta(minutes=30):
+                if now > start + timedelta(minutes=15):
+                    status, css = "Missing In", "status-alert-red"
+                elif now >= start - timedelta(minutes=60):
                     status, css = "Due Soon", "status-upcoming"
 
             cards.append({
@@ -305,7 +311,7 @@ if st.session_state.sess:
                 <div class="shift-card {css}">
                     <div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div>
                     <div class="shift-name">{name}</div>
-                    <div class="shift-role">{role_nm}</div>
+                    <div class="shift-role">{a['role_name']}</div>
                     <div class="punch-time">🕒 {time_display}</div>
                     <br/>
                     <span class="status-badge">{status}</span>
@@ -313,17 +319,14 @@ if st.session_state.sess:
                 """
             })
         
-        if cards:
-            cards.sort(key=lambda x: x['time'])
-            cols = st.columns(4)
-            for i, c in enumerate(cards):
-                with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
-        else:
-            st.info(f"No active shifts found for {target_date.strftime('%m/%d')}.")
+        cards.sort(key=lambda x: x['time'])
+        cols = st.columns(4)
+        for i, c in enumerate(cards):
+            with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
     else:
-        st.info(f"No volunteer schedule found for {target_date.strftime('%m/%d')}.")
+        st.info(f"No volunteer data found for {target_date.strftime('%m/%d')}. Try refreshing or check a different date.")
                 
     time.sleep(60)
     st.rerun()
 else:
-    st.info("Please log in via the sidebar to view the live roster.")
+    st.info("Please log in to view the live board.")
