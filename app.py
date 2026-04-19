@@ -41,7 +41,7 @@ st.markdown("""
     }
     [data-theme="dark"] .shift-card { background-color: #1e2130; color: #ffffff; }
     .shift-time { font-size: 1rem; font-weight: 700; color: #666; margin-bottom: 0.3rem; }
-    .shift-name { font-size: 1.4rem; font-weight: 800; margin-bottom: 0.1rem; }
+    .shift-name { font-size: 1.4rem; font-weight: 800; margin-bottom: 0.1rem; line-height: 1.2; }
     .shift-role { font-size: 0.85rem; text-transform: uppercase; color: #888; font-weight: 600; margin-bottom: 0.8rem; }
     .status-badge { padding: 0.4rem 0.8rem; border-radius: 20px; font-weight: 700; font-size: 0.75rem; text-transform: uppercase; }
     
@@ -64,8 +64,8 @@ st.markdown("""
     .status-upcoming .status-badge { background-color: #007bff; color: white; }
     
     .punch-time {
-        font-size: 0.85rem; color: #a0a6c2; margin-bottom: 1rem; font-weight: 600; 
-        background: rgba(0,0,0,0.1); display: inline-block; padding: 3px 8px; border-radius: 4px;
+        font-size: 0.85rem; color: #718096; margin-bottom: 1rem; font-weight: 600; 
+        background: rgba(0,0,0,0.05); display: inline-block; padding: 4px 10px; border-radius: 6px;
         font-family: 'JetBrains Mono', monospace;
     }
 </style>
@@ -142,7 +142,7 @@ def get_dashboard_data(_sess, target_date_obj):
             'Referer': f'{BASE}/volunteer/',
         }
         
-        # 1. Get Shifts structure
+        # 1. Fetch Shifts (Structure)
         shifts_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts"
         r_shifts = _sess.get(shifts_url, params={"includeShiftRoles": "true", "includeShiftUsers": "true"}, headers=headers)
         if r_shifts.status_code != 200: return None, None
@@ -150,90 +150,90 @@ def get_dashboard_data(_sess, target_date_obj):
         all_shifts_raw = r_shifts.json()
         shift_defs = {s['id']: s for s in all_shifts_raw}
         
-        # 2. Get Enrollments (Assignments)
+        # 2. Fetch Enrollments (Assignments)
         enroll_url = f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/enrollments"
         r_enroll = _sess.get(enroll_url, headers=headers)
         enrollments = r_enroll.json() if r_enroll.status_code == 200 else []
         
-        processed_assignments = []
-        uids = set()
-        
-        # helper to add an assignment safely
-        def add_assignment(s_id, u_id, fname, lname, r_id):
-            if not s_id or not u_id: return
-            s_def = shift_defs.get(s_id)
-            if not s_def: return
-            
-            sd_local = datetime.fromisoformat(s_def['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            ed_local = datetime.fromisoformat(s_def['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            
-            if sd_local.date() == target_date_obj:
-                # Deduplicate
-                if any(a['user_id'] == u_id and a['shift_id'] == s_id for a in processed_assignments):
-                    return
-                
-                # Try to get Role Name
-                r_name = "Volunteer"
-                for role in s_def.get('roles', []):
-                    if role.get('id') == r_id:
-                        r_name = role.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
-                        break
-                
-                processed_assignments.append({
-                    'shift_id': s_id,
-                    'user_id': u_id,
-                    'first_name': fname if fname else "Volunteer",
-                    'last_name': lname if lname else "",
-                    'role_name': r_name,
-                    'start': sd_local,
-                    'end': ed_local
-                })
-                uids.add(u_id)
+        # Merge sources to find every volunteer assigned for that specific day
+        master_assignments = []
+        unique_keys = set()
+        user_ids = set()
 
-        # Populate from Enrollments (Most accurate for future)
+        def register_assignment(sid, uid, fname, lname, rid):
+            if not sid or not uid: return
+            sdef = shift_defs.get(sid)
+            if not sdef: return
+            
+            # Use Local Time for the day comparison
+            start_local = datetime.fromisoformat(sdef['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            if start_local.date() != target_date_obj: return
+            
+            key = f"{sid}-{uid}"
+            if key in unique_keys: return
+            
+            # Find Role Name
+            rname = "Volunteer"
+            for r in sdef.get('roles', []):
+                if r.get('id') == rid:
+                    rname = r.get("eventRoleTexts", [{}])[0].get("eventRoleName", "Volunteer")
+                    break
+
+            master_assignments.append({
+                'sid': sid, 'uid': uid, 
+                'fname': fname if fname else "Volunteer", 
+                'lname': lname if lname else "",
+                'role': rname,
+                'start': start_local,
+                'end': datetime.fromisoformat(sdef['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            })
+            unique_keys.add(key)
+            user_ids.add(uid)
+
+        # Source A: Direct enrollments list
         for e in enrollments:
-            add_assignment(e.get('eventShiftId'), e.get('userId'), e.get('firstName'), e.get('lastName'), e.get('eventRoleId'))
+            register_assignment(e.get('eventShiftId'), e.get('userId'), e.get('firstName'), e.get('lastName'), e.get('eventRoleId'))
 
-        # Populate from Shifts nested data (Captures 'Active' lists)
-        for s_id, s_def in shift_defs.items():
-            for role in s_def.get('roles', []):
+        # Source B: Nested users in shift objects
+        for sid, sdef in shift_defs.items():
+            for role in sdef.get('roles', []):
                 for user in role.get('users', []):
-                    add_assignment(s_id, user['id'], user.get('firstName'), user.get('lastName'), role['id'])
+                    register_assignment(sid, user['id'], user.get('firstName'), user.get('lastName'), role['id'])
 
-        # 3. Fetch Service Time (Punches) AND Profiles (to fix "Volunteer" missing names)
-        service_map = {}
+        # 3. Batch Fetch Punches and Profile Data
+        punch_map = {}
         profile_map = {}
 
-        def fetch_user_data(uid):
-            # Service Time
-            svc_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
-            r_svc = _sess.get(svc_url, headers=headers)
-            svc = r_svc.json() if r_svc.status_code == 200 else []
+        def fetch_user_context(uid):
+            # Service Time (Punches)
+            s_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}/serviceTime"
+            r_s = _sess.get(s_url, headers=headers)
+            punches = r_s.json() if r_s.status_code == 200 else []
             
-            # Profile (to recover names if they were missing in enrollment)
-            prof_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}"
-            r_prof = _sess.get(prof_url, headers=headers)
-            prof = r_prof.json() if r_prof.status_code == 200 else {}
+            # Profile (Real names fallback)
+            p_url = f"{BASE}/api/v4/organizations/{ORG_ID}/users/{uid}"
+            r_p = _sess.get(p_url, headers=headers)
+            prof = r_p.json() if r_p.status_code == 200 else {}
             
-            return uid, svc, prof
+            return uid, punches, prof
 
         with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = [pool.submit(fetch_user_data, uid) for uid in uids]
+            futures = [pool.submit(fetch_user_context, uid) for uid in user_ids]
             for f in as_completed(futures):
-                uid, svc, prof = f.result()
-                service_map[uid] = svc
+                uid, p_data, prof = f.result()
+                punch_map[uid] = p_data
                 profile_map[uid] = prof
 
-        # 4. Final Polish: Update names from profile map if they were generic
-        for a in processed_assignments:
-            p = profile_map.get(a['user_id'], {})
-            if a['first_name'] == "Volunteer" and p.get('firstName'):
-                a['first_name'] = p['firstName']
-                a['last_name'] = p.get('lastName', '')
+        # 4. Data Cleanup: Replace "Volunteer" placeholders with real names from profiles
+        for a in master_assignments:
+            p = profile_map.get(a['uid'], {})
+            if a['fname'] == "Volunteer" and p.get('firstName'):
+                a['fname'] = p['firstName']
+                a['lname'] = p.get('lastName', '')
 
-        return processed_assignments, service_map
+        return master_assignments, punch_map
     except Exception as e:
-        st.error(f"Data Sync Error: {e}")
+        st.error(f"Sync failed: {e}")
         return None, None
 
 # ─── App UI ───
@@ -244,15 +244,15 @@ with st.sidebar:
     st.title("🐾 Staff Access")
     if st.session_state.sess is None:
         with st.form("auth_form"):
-            user_email = st.text_input("Bloomerang Email")
-            user_pw = st.text_input("Password", type="password")
+            email = st.text_input("Bloomerang Email")
+            pw = st.text_input("Password", type="password")
             if st.form_submit_button("Log In"):
                 with st.spinner("Authenticating..."):
-                    st.session_state.sess = authenticate_headless(user_email, user_pw)
+                    st.session_state.sess = authenticate_headless(email, pw)
                     if st.session_state.sess: st.rerun()
     else:
         st.success("Session Active")
-        if st.button("Refresh Roster"): 
+        if st.button("Refresh Board"): 
             st.cache_data.clear()
             st.rerun()
         if st.button("Log Out"): 
@@ -267,31 +267,30 @@ if st.session_state.sess:
     with col1:
         st.title(f"Refuge Roster — {target_date.strftime('%A, %b %d')}")
     
-    with st.spinner("Processing live data..."):
-        assignments, svc_data = get_dashboard_data(st.session_state.sess, target_date)
+    with st.spinner("Finding volunteers..."):
+        assignments, punch_data = get_dashboard_data(st.session_state.sess, target_date)
     
     if assignments:
         cards = []
         for a in assignments:
-            name = f"{a['first_name']} {a['last_name']}".strip()
-            start = a['start']
-            end = a['end']
+            full_name = f"{a['fname']} {a['lname']}".strip()
+            start, end = a['start'], a['end']
             
-            # Match Punch
-            punches = svc_data.get(a['user_id'], [])
-            rec = next((p for p in punches if p.get('eventShiftId') == a['shift_id']), None)
+            # Find the punch that overlaps with this shift
+            user_punches = punch_data.get(a['uid'], [])
+            punch = next((p for p in user_punches if p.get('eventShiftId') == a['sid']), None)
             
-            # If no direct shift match, try date overlap match (common for manual edits)
-            if not rec:
-                for p in punches:
+            # If no ID link, try date overlap
+            if not punch:
+                for p in user_punches:
                     if p.get('startTimestamp'):
-                        p_dt = datetime.fromisoformat(p['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                        if p_dt.date() == target_date:
-                            rec = p
+                        p_start = datetime.fromisoformat(p['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                        if p_start.date() == target_date:
+                            punch = p
                             break
 
-            cin_dt = datetime.fromisoformat(rec['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if rec and rec.get('startTimestamp') else None
-            cout_dt = datetime.fromisoformat(rec['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if rec and rec.get('endTimestamp') else None
+            cin_dt = datetime.fromisoformat(punch['startTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if punch and punch.get('startTimestamp') else None
+            cout_dt = datetime.fromisoformat(punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ) if punch and punch.get('endTimestamp') else None
             
             c_in_str = cin_dt.strftime('%I:%M %p') if cin_dt else "--"
             c_out_str = cout_dt.strftime('%I:%M %p') if cout_dt else "--"
@@ -316,8 +315,8 @@ if st.session_state.sess:
                 "html": f"""
                 <div class="shift-card {css}">
                     <div class="shift-time">{start.strftime("%I:%M %p")} - {end.strftime("%I:%M %p")}</div>
-                    <div class="shift-name">{name}</div>
-                    <div class="shift-role">{a['role_name']}</div>
+                    <div class="shift-name">{full_name}</div>
+                    <div class="shift-role">{a['role']}</div>
                     <div class="punch-time">🕒 {time_display}</div>
                     <br/>
                     <span class="status-badge">{status}</span>
@@ -330,9 +329,9 @@ if st.session_state.sess:
         for i, c in enumerate(cards):
             with cols[i % 4]: st.markdown(c['html'], unsafe_allow_html=True)
     else:
-        st.info(f"No volunteer schedule found for {target_date.strftime('%m/%d')}.")
+        st.info(f"No volunteer data found for {target_date.strftime('%m/%d')}. Please refresh or try another date.")
                 
     time.sleep(60)
     st.rerun()
 else:
-    st.info("Please log in to view the live board.")
+    st.info("Please log in to view the board.")
