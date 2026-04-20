@@ -356,21 +356,60 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     if isinstance(attendance, str):
         attendance = []
 
-    # 2b. Try the event-scoped /presence endpoint — this is the ONLY place the
-    # Bloomerang API exposes live check-in / clock-in state. Returns an array of
-    # presence records with {status, eventShiftId, eventUserAccountId, username,
-    # dateCreated}. May return 403 for volunteer-level tokens — if so, we fall
-    # back to serviceTime-only detection (which misses active check-ins).
-    presence_raw = safe_get_json(
+    # 2b. LIVE PRESENCE — two strategies, either one is enough:
+    #
+    #   Strategy A:  GET /events/{event_id}/presence
+    #       Direct endpoint. Reported 403 for volunteer tokens.
+    #
+    #   Strategy B:  GET /events/{event_id}/users?includeUsersPresence=true
+    #       Per OpenAPI spec, each user object in the response carries a `checkins`
+    #       array with the latest presence record. Since volunteers need to read
+    #       event rosters, this path has a better permission profile.
+    #
+    # We try BOTH and merge whatever comes back.
+
+    presence_data = []
+    presence_error = None
+
+    # Strategy A
+    pres_raw = safe_get_json(
         _auth_dict,
         f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/presence"
     )
-    if isinstance(presence_raw, list):
-        presence_data = presence_raw
-        presence_error = None
+    if isinstance(pres_raw, list):
+        presence_data.extend(pres_raw)
     else:
-        presence_data = []
-        presence_error = presence_raw  # keep the error string for debug panel
+        presence_error = pres_raw  # will try Strategy B
+
+    # Strategy B — event users with presence embedded
+    eu_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users",
+        {"includeUsersPresence": "true"}
+    )
+    event_users_error = None
+    if isinstance(eu_raw, list):
+        extracted = 0
+        for u in eu_raw:
+            # The 'checkins' array holds the presence records for this user
+            checkins = u.get('checkins') or []
+            uid = u.get('id') or u.get('eventUserAccountId')
+            for ci in checkins:
+                # Normalize: presence records expect eventUserAccountId; some may
+                # only carry it at the parent user level.
+                if 'eventUserAccountId' not in ci and uid is not None:
+                    ci['eventUserAccountId'] = uid
+                presence_data.append(ci)
+                extracted += 1
+        # If Strategy A failed but B succeeded, clear the error so the UI banner
+        # goes green.
+        if extracted > 0 and presence_error:
+            presence_error = None
+    else:
+        event_users_error = eu_raw
+        # If Strategy A also failed, surface the combined situation.
+        if presence_error and not presence_data:
+            presence_error = f"presence: {presence_error} | users?includeUsersPresence: {eu_raw}"
 
     raw_people = []
     uids = set()
@@ -497,6 +536,7 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "sources": source_map,
         "presence": presence_data,
         "presence_error": presence_error,
+        "event_users_error": event_users_error,
     }
     return final_roster, punch_map, meta
 
@@ -579,10 +619,9 @@ if st.session_state.auth_data:
         # ── Presence endpoint status banner ──
         if presence_error:
             st.warning(
-                f"⚠️ `/presence` endpoint returned: **{presence_error}**. "
-                "Live check-in status is unavailable — the dashboard will only show "
-                "who has *completed* their shift (via serviceTime). It cannot show who "
-                "is currently clocked in."
+                f"⚠️ Live presence unavailable. API returned: `{str(presence_error)[:200]}`. "
+                "Dashboard will only show who has *completed* their shift (via serviceTime). "
+                "It cannot show who is currently clocked in."
             )
         elif presence_list:
             st.success(
@@ -592,15 +631,30 @@ if st.session_state.auth_data:
         if st.session_state.get("debug_mode"):
             import json as _json
 
-            st.markdown('<div class="section-header">🔬 Debug — /presence endpoint</div>',
+            event_users_error = meta.get("event_users_error")
+
+            st.markdown('<div class="section-header">🔬 Debug — Live Presence Sources</div>',
                         unsafe_allow_html=True)
-            if presence_error:
-                st.error(f"GET /presence failed: `{presence_error}`")
-            else:
-                st.write(f"GET /presence returned **{len(presence_list)} records**")
-                if presence_list:
-                    with st.expander(f"View all {len(presence_list)} presence records"):
-                        st.json(presence_list)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Strategy A: `GET /events/{id}/presence`**")
+                if presence_error and not presence_list:
+                    st.error(f"Failed: `{str(presence_error)[:150]}`")
+                else:
+                    st.success(f"OK")
+
+            with col2:
+                st.write("**Strategy B: `GET /events/{id}/users?includeUsersPresence=true`**")
+                if event_users_error:
+                    st.error(f"Failed: `{str(event_users_error)[:150]}`")
+                else:
+                    st.success("OK")
+
+            st.write(f"**Total presence records merged: {len(presence_list)}**")
+            if presence_list:
+                with st.expander(f"View all {len(presence_list)} presence records"):
+                    st.json(presence_list)
 
             in_progress = [v for v in roster
                            if v['start'] - timedelta(minutes=30) <= now <= v['end'] + timedelta(minutes=30)]
