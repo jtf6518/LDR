@@ -382,6 +382,17 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         presence_error = pres_raw  # will try Strategy B
 
     # Strategy B — event users with presence embedded
+    # We make TWO calls so we can diagnose: one without the presence flag (does
+    # the endpoint work at all for this token?) and one with it (is the presence
+    # flag what's blocked?).
+    eu_basic_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users",
+    )
+    eu_basic_ok = isinstance(eu_basic_raw, list)
+    eu_basic_count = len(eu_basic_raw) if eu_basic_ok else 0
+    eu_basic_error = None if eu_basic_ok else eu_basic_raw
+
     eu_raw = safe_get_json(
         _auth_dict,
         f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users",
@@ -537,6 +548,10 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "presence": presence_data,
         "presence_error": presence_error,
         "event_users_error": event_users_error,
+        "eu_basic_ok": eu_basic_ok,
+        "eu_basic_count": eu_basic_count,
+        "eu_basic_error": eu_basic_error,
+        "eu_sample": eu_raw if isinstance(eu_raw, list) and eu_raw else None,
     }
     return final_roster, punch_map, meta
 
@@ -632,29 +647,70 @@ if st.session_state.auth_data:
             import json as _json
 
             event_users_error = meta.get("event_users_error")
+            eu_basic_ok = meta.get("eu_basic_ok")
+            eu_basic_count = meta.get("eu_basic_count", 0)
+            eu_basic_error = meta.get("eu_basic_error")
+            eu_sample = meta.get("eu_sample")
 
             st.markdown('<div class="section-header">🔬 Debug — Live Presence Sources</div>',
                         unsafe_allow_html=True)
 
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             with col1:
-                st.write("**Strategy A: `GET /events/{id}/presence`**")
+                st.write("**A: `/events/{id}/presence`**")
                 if presence_error and not presence_list:
-                    st.error(f"Failed: `{str(presence_error)[:150]}`")
-                else:
-                    st.success(f"OK")
-
-            with col2:
-                st.write("**Strategy B: `GET /events/{id}/users?includeUsersPresence=true`**")
-                if event_users_error:
-                    st.error(f"Failed: `{str(event_users_error)[:150]}`")
+                    st.error(f"`{str(presence_error)[:120]}`")
                 else:
                     st.success("OK")
+
+            with col2:
+                st.write("**B1: `/events/{id}/users`** (no presence flag)")
+                if eu_basic_ok:
+                    st.success(f"OK — {eu_basic_count} users")
+                else:
+                    st.error(f"`{str(eu_basic_error)[:120]}`")
+
+            with col3:
+                st.write("**B2: `...users?includeUsersPresence=true`**")
+                if event_users_error:
+                    st.error(f"`{str(event_users_error)[:120]}`")
+                else:
+                    st.success("OK")
+
+            # Interpretation hints — key question is whether B1 works
+            if eu_basic_ok and event_users_error:
+                st.info(
+                    "📍 The users endpoint IS reachable for your token, but the "
+                    "`includeUsersPresence` flag specifically is blocked. This suggests "
+                    "presence data requires elevated permissions."
+                )
+            elif eu_basic_ok and not event_users_error:
+                st.info(
+                    "📍 Both the users endpoint AND the presence flag work. "
+                    f"Currently {len(presence_list)} presence records merged — "
+                    "if this is 0, no one is checked in right now, which is expected "
+                    "when no shifts are active."
+                )
+            elif not eu_basic_ok:
+                st.info(
+                    "📍 The users endpoint itself is blocked for your token, not "
+                    "just presence. This is a broader permission restriction."
+                )
 
             st.write(f"**Total presence records merged: {len(presence_list)}**")
             if presence_list:
                 with st.expander(f"View all {len(presence_list)} presence records"):
                     st.json(presence_list)
+
+            # If B2 succeeded, show a sample user to confirm the shape
+            if eu_sample:
+                with st.expander(f"Sample event-user object (first of {len(eu_sample)})"):
+                    sample = eu_sample[0].copy()
+                    # Redact PII since we're just checking structure
+                    for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                        if k in sample:
+                            sample[k] = '[redacted]'
+                    st.json(sample)
 
             in_progress = [v for v in roster
                            if v['start'] - timedelta(minutes=30) <= now <= v['end'] + timedelta(minutes=30)]
