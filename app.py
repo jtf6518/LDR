@@ -356,6 +356,22 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     if isinstance(attendance, str):
         attendance = []
 
+    # 2b. Try the event-scoped /presence endpoint — this is the ONLY place the
+    # Bloomerang API exposes live check-in / clock-in state. Returns an array of
+    # presence records with {status, eventShiftId, eventUserAccountId, username,
+    # dateCreated}. May return 403 for volunteer-level tokens — if so, we fall
+    # back to serviceTime-only detection (which misses active check-ins).
+    presence_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/presence"
+    )
+    if isinstance(presence_raw, list):
+        presence_data = presence_raw
+        presence_error = None
+    else:
+        presence_data = []
+        presence_error = presence_raw  # keep the error string for debug panel
+
     raw_people = []
     uids = set()
     seen_keys = set()
@@ -477,7 +493,12 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         p['fname'], p['lname'] = fname, lname
         final_roster.append(p)
 
-    return final_roster, punch_map, source_map
+    meta = {
+        "sources": source_map,
+        "presence": presence_data,
+        "presence_error": presence_error,
+    }
+    return final_roster, punch_map, meta
 
 
 # ─── App UI ───────────────────────────────────────────────────────────────────
@@ -529,12 +550,58 @@ if st.session_state.auth_data:
                 st.error(f"API Error: {data[0]}")
                 st.stop()
 
-        roster, punches, sources = data
+        roster, punches, meta = data
+        sources = meta.get("sources", {})
+        presence_list = meta.get("presence", [])
+        presence_error = meta.get("presence_error")
+
+        # Build two lookups from presence data:
+        #   (uid, sid) -> latest status record  (shift-scoped clock-ins)
+        #   uid -> latest status record         (event-level check-ins w/ sid=null)
+        presence_by_shift = {}
+        presence_by_user = {}
+        for rec in presence_list:
+            uid = rec.get("eventUserAccountId")
+            sid = rec.get("eventShiftId")
+            if uid is None:
+                continue
+            # Keep most recent record per key (by dateCreated string compare — ISO format)
+            if sid:
+                key = (uid, sid)
+                prev = presence_by_shift.get(key)
+                if not prev or (rec.get("dateCreated", "") > prev.get("dateCreated", "")):
+                    presence_by_shift[key] = rec
+            prev_u = presence_by_user.get(uid)
+            if not prev_u or (rec.get("dateCreated", "") > prev_u.get("dateCreated", "")):
+                presence_by_user[uid] = rec
 
     if roster:
+        # ── Presence endpoint status banner ──
+        if presence_error:
+            st.warning(
+                f"⚠️ `/presence` endpoint returned: **{presence_error}**. "
+                "Live check-in status is unavailable — the dashboard will only show "
+                "who has *completed* their shift (via serviceTime). It cannot show who "
+                "is currently clocked in."
+            )
+        elif presence_list:
+            st.success(
+                f"✓ Live presence feed active — {len(presence_list)} presence records loaded."
+            )
         # ── Debug panel (if enabled) — show raw serviceTime for users on in-progress shifts ──
         if st.session_state.get("debug_mode"):
             import json as _json
+
+            st.markdown('<div class="section-header">🔬 Debug — /presence endpoint</div>',
+                        unsafe_allow_html=True)
+            if presence_error:
+                st.error(f"GET /presence failed: `{presence_error}`")
+            else:
+                st.write(f"GET /presence returned **{len(presence_list)} records**")
+                if presence_list:
+                    with st.expander(f"View all {len(presence_list)} presence records"):
+                        st.json(presence_list)
+
             in_progress = [v for v in roster
                            if v['start'] - timedelta(minutes=30) <= now <= v['end'] + timedelta(minutes=30)]
 
@@ -546,9 +613,7 @@ if st.session_state.auth_data:
             else:
                 st.caption(
                     "For each user whose shift is currently active, this shows what "
-                    "/serviceTime is returning. If a user is checked in via the Bloomerang app "
-                    "but nothing shows here, the API likely isn't exposing active check-ins "
-                    "to volunteer-level accounts."
+                    "/serviceTime is returning AND what /presence says about them."
                 )
 
                 for v in in_progress:
@@ -565,26 +630,28 @@ if st.session_state.auth_data:
                             except Exception:
                                 pass
                         elif not p.get('endTimestamp') and p.get('dayDate', '').startswith(t_date.isoformat()):
-                            # manager-fix entry for today
                             todays.append(p)
 
                     src = sources.get(v['uid'], {})
+                    pres_rec = presence_by_shift.get((v['uid'], v['sid'])) or presence_by_user.get(v['uid'])
+                    pres_label = f"presence: {pres_rec.get('status', '?')}" if pres_rec else "presence: none"
+
                     label = (f"{v['fname']} {v['lname']} · "
-                             f"shift {v['start'].strftime('%I:%M %p')} (sid={v['sid']}, uid={v['uid']})  "
-                             f"— org endpoint: {src.get('org', 0)} records, "
-                             f"event endpoint: {src.get('event', 0)} records, "
-                             f"today: {len(todays)}")
+                             f"shift {v['start'].strftime('%I:%M %p')} (sid={v['sid']}, uid={v['uid']}) — "
+                             f"svc org: {src.get('org', 0)}, svc evt: {src.get('event', 0)}, today: {len(todays)}, {pres_label}")
 
                     with st.expander(label):
+                        if pres_rec:
+                            st.write("**Presence record:**")
+                            st.json(pres_rec)
                         if todays:
+                            st.write("**ServiceTime records (today):**")
                             st.json(todays)
-                        else:
+                        if not pres_rec and not todays:
                             st.warning(
-                                "No serviceTime records returned for today from either endpoint. "
-                                "If this user IS clocked in right now, the check-in is not visible "
-                                "to this API token. Likely causes: (1) check-ins only appear after "
-                                "clock-out, or (2) active presence is on /presence which returns 403 "
-                                "for volunteer-level accounts."
+                                "No presence record AND no serviceTime records for today. "
+                                "If this user is actually clocked in, neither endpoint is exposing it "
+                                "to this API token."
                             )
 
         # ── Assemble cards + status, collect counts ──
@@ -602,20 +669,43 @@ if st.session_state.auth_data:
             cout = (datetime.fromisoformat(my_punch['endTimestamp'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
                     if my_punch and my_punch.get('endTimestamp') else None)
 
+            # ── Consult presence endpoint for LIVE check-in state ──
+            # presence.status values typically: "checkedIn", "clockedIn", "checkedOut",
+            # "clockedOut" (exact strings may vary — we treat any non-"out" value as "in").
+            presence_rec = presence_by_shift.get((v['uid'], v['sid'])) or presence_by_user.get(v['uid'])
+            pres_status = (presence_rec or {}).get("status", "")
+            pres_is_in = False
+            if pres_status:
+                s_lower = pres_status.lower()
+                pres_is_in = ("in" in s_lower) and ("out" not in s_lower)
+
             p_str = (f"In: {cin.strftime('%I:%M %p') if cin else '--'}"
                      f" → Out: {cout.strftime('%I:%M %p') if cout else '--'}")
+            if pres_is_in and not cin:
+                # Live check-in, no serviceTime record yet — show presence timestamp
+                pd = presence_rec.get("dateCreated", "")
+                try:
+                    dt = datetime.fromisoformat(pd.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                    p_str = f"In: {dt.strftime('%I:%M %p')} → Out: --  (live)"
+                except Exception:
+                    p_str = "In: (checked in) → Out: --"
 
             # Determine status
             if cin and cout:
                 status, css = "Completed", "status-completed"
-            elif cin:
-                if now > v['end'] + timedelta(minutes=LATE_OUT_MINUTES):
+            elif cin or pres_is_in:
+                if cin and now > v['end'] + timedelta(minutes=LATE_OUT_MINUTES):
                     status, css = "Late Out", "status-alert-red"
                 else:
                     status, css = "On Shift", "status-checked-in"
             else:
                 if now > v['start'] + timedelta(minutes=LATE_IN_MINUTES):
-                    status, css = "No Show / Late", "status-alert-red"
+                    # Only alarm as No Show if presence endpoint IS working (we'd see them if they were in).
+                    # If presence is unavailable, we genuinely don't know, so show a softer state.
+                    if presence_error:
+                        status, css = "In Progress (unknown)", "status-pending"
+                    else:
+                        status, css = "No Show / Late", "status-alert-red"
                 elif now >= v['start'] - timedelta(minutes=60):
                     status, css = "Starting Soon", "status-upcoming"
                 else:
