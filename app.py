@@ -717,6 +717,52 @@ def get_dashboard_data(_auth_dict, target_date_obj):
             'harvested': harvested,
         })
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # Strategy K — probe ALTERNATE HOSTS for the v1 API.
+    # The 404s from Strategy J proved the v1 paths don't live on
+    # volunteer.bloomerang.co. The APK listed api-dev/staging/nightly/migration
+    # .initlive.com but not a production variant. The obvious guesses for
+    # production are api.initlive.com and a few Bloomerang variants.
+    #
+    # We use a fresh no-auth requests call since our cookies are scoped to
+    # bloomerang.co and won't apply cross-domain. The STATUS CODE tells us
+    # what we need:
+    #   200        → endpoint open (unlikely without auth)
+    #   401 / 403  → host + path correct, just need auth
+    #   404        → wrong host OR wrong path
+    #   connection error → host doesn't resolve/accept connections
+    # ═══════════════════════════════════════════════════════════════════════
+    k_results = []
+    alt_probe_hosts = [
+        "https://api.initlive.com",
+        "https://api-prod.initlive.com",
+        "https://api.bloomerang.co",
+    ]
+    # Use the most likely-to-exist path as our probe
+    probe_path = f"/api/v1/eventCheckin/event/{EVENT_ID}"
+
+    for host in alt_probe_hosts:
+        url = host + probe_path
+        try:
+            import requests as _rq
+            r = _rq.get(url, timeout=8, headers={
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 12) Bloomerang-Volunteer-Recon',
+                'Accept': 'application/json',
+            })
+            k_results.append({
+                'url': url,
+                'status': r.status_code,
+                'body': r.text[:300],
+                'is_html': r.text.lstrip().startswith('<'),
+            })
+        except Exception as e:
+            k_results.append({
+                'url': url,
+                'status': 'CONN_ERR',
+                'body': str(e)[:300],
+                'is_html': False,
+            })
+
     raw_people = []
     uids = set()
     seen_keys = set()
@@ -883,6 +929,8 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "token_claims": token_claims,
         # Strategy J (v1 legacy endpoints from APK)
         "j_results": j_results,
+        # Strategy K (alternate hosts — probe for v1 API on non-bloomerang domains)
+        "k_results": k_results,
     }
     return final_roster, punch_map, meta
 
@@ -1184,7 +1232,7 @@ if st.session_state.auth_data:
                         "limited (e.g., 'openid profile' only), that's why /presence returns 403."
                     )
 
-            # ── Strategy J — the big one, legacy v1 API endpoints from the APK ──
+            # ── Strategy J — legacy v1 API endpoints from APK recon ──
             st.markdown('<div class="section-header">🎯 Strategy J — Legacy v1 API '
                         '(from APK recon)</div>', unsafe_allow_html=True)
 
@@ -1233,6 +1281,35 @@ if st.session_state.auth_data:
                             st.json(_j.loads(s_str))
                         except Exception:
                             st.write(s)
+
+            # ── Strategy K — alternate hosts ──
+            st.markdown('<div class="section-header">🌐 Strategy K — Alternate Host Probes</div>',
+                        unsafe_allow_html=True)
+            st.caption(
+                "The v1 paths don't exist on volunteer.bloomerang.co (404s in Strategy J). "
+                "Probing other hosts the APK mentioned. **401/403 is good news** — means "
+                "the host + path are correct and we just need to auth. 404 means wrong host."
+            )
+
+            for kr in meta.get("k_results", []) or []:
+                status = kr.get("status")
+                is_html = kr.get("is_html")
+                if status in (200, 201, 204):
+                    verdict = "🎉 OPEN"
+                elif status in (401, 403):
+                    verdict = "✅ HOST + PATH CORRECT (need auth)"
+                elif status == 404:
+                    verdict = "❌ 404 — wrong host or path"
+                elif status == 'CONN_ERR':
+                    verdict = "❌ Host unreachable"
+                else:
+                    verdict = f"⚠️ {status}"
+
+                with st.expander(f"{verdict}  —  `{kr.get('url')}`"):
+                    st.write(f"**Status:** `{status}`")
+                    st.write(f"**HTML response?** `{is_html}`")
+                    st.caption("Body (first 300 chars):")
+                    st.code(kr.get("body", ""), language=None)
 
             if meta.get("e_sample"):
                 with st.expander("Self user object (E response — check for `checkins` field)"):
