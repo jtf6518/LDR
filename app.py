@@ -23,6 +23,7 @@ except ImportError as e:
 BASE = "https://volunteer.bloomerang.co"
 ORG_ID = 5269
 EVENT_ID = 51764
+SELF_UID = 2008686   # John Frank — used as fallback when Cognito token extraction fails
 LOCAL_TZ = ZoneInfo("America/New_York")
 CACHE_TTL = 30        # seconds - short so check-ins surface quickly
 REFRESH_SECS = 120    # auto-rerun interval (2 minutes)
@@ -466,10 +467,17 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     d_ok = isinstance(d_raw, list)
     d_checkin_hits = 0
     d_error = None if d_ok else d_raw
+    d_sample_user = None
+    d_has_checkins_field = False  # does ANY user object have a 'checkins' key at all?
     if d_ok:
         for sh in d_raw:
             for role in sh.get('roles', []):
                 for u in role.get('users', []):
+                    # Capture structural info from the first user we see
+                    if d_sample_user is None:
+                        d_sample_user = u
+                    if 'checkins' in u:
+                        d_has_checkins_field = True
                     checkins = u.get('checkins') or []
                     for ci in checkins:
                         if 'eventUserAccountId' not in ci:
@@ -482,6 +490,7 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     # Strategy E — can the logged-in user read THEIR OWN presence?
     # Try to extract the self user id from the bearer token payload.
     self_uid = None
+    self_uid_source = None
     tok = _auth_dict.get('token') or ''
     if tok.count('.') == 2:
         try:
@@ -494,12 +503,18 @@ def get_dashboard_data(_auth_dict, target_date_obj):
                 if k in claims:
                     try:
                         self_uid = int(claims[k])
+                        self_uid_source = f"token claim '{k}'"
                         break
                     except (ValueError, TypeError):
                         self_uid = claims[k]
+                        self_uid_source = f"token claim '{k}' (non-int)"
                         break
         except Exception:
             pass
+
+    if self_uid is None:
+        self_uid = SELF_UID
+        self_uid_source = "SELF_UID constant"
 
     e_raw = None
     e_error = None
@@ -663,8 +678,11 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "d_ok": d_ok,
         "d_checkin_hits": d_checkin_hits,
         "d_error": d_error,
+        "d_sample_user": d_sample_user,
+        "d_has_checkins_field": d_has_checkins_field,
         # Strategy E (self read)
         "self_uid": self_uid,
+        "self_uid_source": self_uid_source,
         "e_ok": e_ok,
         "e_error": e_error,
         "e_sample": e_raw if e_ok else None,
@@ -824,18 +842,21 @@ if st.session_state.auth_data:
                 "D",
                 "`GET /events/{id}/shifts?includeUsersPresence=true`  — **undocumented flag on shifts**",
                 meta.get("d_ok"),
-                f"endpoint OK; checkins found: {meta.get('d_checkin_hits', 0)}",
+                f"endpoint OK; checkins field on user objects: "
+                f"{'✓ PRESENT' if meta.get('d_has_checkins_field') else '✗ ABSENT (flag likely ignored)'}; "
+                f"checkins found: {meta.get('d_checkin_hits', 0)}",
                 meta.get("d_error"),
             )
             # E
             self_uid_val = meta.get("self_uid")
+            self_uid_src = meta.get("self_uid_source", "unknown")
             result_row(
                 "E",
                 f"`GET /events/{{id}}/users/{{SELF}}?includeUsersPresence=true`  "
-                f"— can I read my OWN presence? (self_uid={self_uid_val or 'unknown'})",
+                f"— can I read my OWN presence? (self_uid={self_uid_val}, via {self_uid_src})",
                 meta.get("e_ok"),
                 "self record returned",
-                meta.get("e_error") if self_uid_val else "Could not extract self_uid from token",
+                meta.get("e_error"),
             )
 
             st.divider()
@@ -870,6 +891,28 @@ if st.session_state.auth_data:
                         if k in sample:
                             sample[k] = '[redacted]'
                     st.json(sample)
+
+            if meta.get("d_sample_user"):
+                with st.expander("🔑 Sample user from Strategy D  — does it have a `checkins` field?"):
+                    sample = meta["d_sample_user"].copy() if isinstance(meta["d_sample_user"], dict) else meta["d_sample_user"]
+                    if isinstance(sample, dict):
+                        for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                            if k in sample:
+                                sample[k] = '[redacted]'
+                    st.json(sample)
+                    if meta.get("d_has_checkins_field"):
+                        st.success(
+                            "✓ The `checkins` field IS present on user objects — Strategy D "
+                            "is genuinely honoring the `includeUsersPresence=true` flag. "
+                            "It's empty now because nobody's checked in, but it should populate "
+                            "during active shifts."
+                        )
+                    else:
+                        st.warning(
+                            "✗ No `checkins` field found on any user object. The `/shifts` "
+                            "endpoint returned 200, but silently ignored the "
+                            "`includeUsersPresence=true` flag. Strategy D is a false positive."
+                        )
 
             if meta.get("e_sample"):
                 with st.expander("Self user object (E response — check for `checkins` field)"):
