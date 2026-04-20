@@ -504,23 +504,28 @@ def render_card(card):
     cin, cout = card['cin'], card['cout']
     full_name = f"{v['fname']} {v['lname']}".strip()
 
-    punch_box = ""
     if cin or cout:
         cin_str = cin.strftime('%I:%M %p') if cin else '--'
         cout_str = cout.strftime('%I:%M %p') if cout else '--'
         punch_box = f'<div class="punch-box">🕒 In: {cin_str} → Out: {cout_str}</div>'
     elif status == 'Completed (Fixed)':
         punch_box = '<div class="punch-box">✎ Hours manually credited</div>'
+    else:
+        punch_box = ''
 
-    return f"""
-    <div class="shift-card {css}">
-        <div class="shift-time">{v['start'].strftime('%I:%M %p')} — {v['end'].strftime('%I:%M %p')}</div>
-        <div class="shift-name">{full_name}</div>
-        <div class="shift-role">{v['role']}</div>
-        {punch_box}
-        <div style="margin-top:12px;"><span class="status-badge">{status}</span></div>
-    </div>
-    """
+    time_str = f"{v['start'].strftime('%I:%M %p')} — {v['end'].strftime('%I:%M %p')}"
+
+    # Single-line HTML — no indentation or blank lines that would confuse
+    # Streamlit's markdown-to-HTML passthrough into rendering fragments as text.
+    return (
+        f'<div class="shift-card {css}">'
+        f'<div class="shift-time">{time_str}</div>'
+        f'<div class="shift-name">{full_name}</div>'
+        f'<div class="shift-role">{v["role"]}</div>'
+        f'{punch_box}'
+        f'<div style="margin-top:12px;"><span class="status-badge">{status}</span></div>'
+        f'</div>'
+    )
 
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
