@@ -500,7 +500,7 @@ def render_meta_bar(counts, total, sync_time=None):
     st.markdown(f'<div class="meta-bar">{"".join(parts)}</div>', unsafe_allow_html=True)
 
 
-def render_card(card):
+def render_card(card, debug=False):
     v = card['v']
     status, css = card['status'], card['css']
     cin, cout = card['cin'], card['cout']
@@ -517,6 +517,18 @@ def render_card(card):
 
     time_str = f"{v['start'].strftime('%I:%M %p')} — {v['end'].strftime('%I:%M %p')}"
 
+    # Debug footer: show shift's own ID and the matched punch's shift ID
+    debug_footer = ''
+    if debug:
+        matched_sid = card.get('matched_sid', 'none')
+        matched_ok = '✓' if matched_sid == v['sid'] else ('∅' if matched_sid == 'none' else '⚠︎ MISMATCH')
+        debug_footer = (
+            f'<div style="margin-top:8px; padding:6px 10px; background:rgba(0,0,0,0.4); '
+            f'border-radius:6px; font-family:JetBrains Mono,monospace; font-size:0.7rem; '
+            f'color:#94a3b8;">shift.id={v["sid"]}<br/>'
+            f'matched punch.eventShiftId={matched_sid} {matched_ok}</div>'
+        )
+
     # Single-line HTML — no indentation or blank lines that would confuse
     # Streamlit's markdown-to-HTML passthrough into rendering fragments as text.
     return (
@@ -526,6 +538,7 @@ def render_card(card):
         f'<div class="shift-role">{v["role"]}</div>'
         f'{punch_box}'
         f'<div style="margin-top:12px;"><span class="status-badge">{status}</span></div>'
+        f'{debug_footer}'
         f'</div>'
     )
 
@@ -591,6 +604,12 @@ with st.sidebar:
             for k in ('auth_data', 'credentials', 'last_reauth', '_date_selection'):
                 st.session_state.pop(k, None)
             st.rerun()
+        st.session_state['debug_mode'] = st.checkbox(
+            "🔬 Show shift IDs on cards",
+            value=st.session_state.get('debug_mode', False),
+            help="Displays each shift's id and the eventShiftId of its matched punch, "
+                 "so you can verify shift→punch attribution.",
+        )
         st.caption(f"Auto-refreshes every {REFRESH_SECS}s")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -671,7 +690,10 @@ else:
             p = find_punch(user_punches, v, date_key)
             status, css, cin, cout = classify(v, p, now)
             counts[status] = counts.get(status, 0) + 1
-            cards.append({'v': v, 'status': status, 'css': css, 'cin': cin, 'cout': cout})
+            cards.append({
+                'v': v, 'status': status, 'css': css, 'cin': cin, 'cout': cout,
+                'matched_sid': p.get('eventShiftId') if p else 'none',
+            })
 
         cards.sort(key=lambda c: c['v']['start'])
 
@@ -690,7 +712,8 @@ else:
         cols = st.columns(4)
         for idx, card in enumerate(cards):
             with cols[idx % 4]:
-                st.markdown(render_card(card), unsafe_allow_html=True)
+                st.markdown(render_card(card, debug=st.session_state.get('debug_mode', False)),
+                            unsafe_allow_html=True)
 
 # ─── Auto-refresh ─────────────────────────────────────────────────────────────
 time.sleep(REFRESH_SECS)
