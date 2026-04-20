@@ -398,14 +398,16 @@ def find_punch(user_punches, shift_info, t_date):
     if not user_punches:
         return None
 
-    sid = shift_info['sid']
+    # Compare as strings so int/str mismatches (common in JSON APIs) don't silently fail
+    sid = str(shift_info['sid'])
     iso_day = t_date.isoformat()
 
     exact_real, exact_fixed = [], []
 
     for p in user_punches:
-        if p.get('eventShiftId') != sid:
-            continue  # punch belongs to a different shift
+        p_sid_raw = p.get('eventShiftId')
+        if p_sid_raw is None or str(p_sid_raw) != sid:
+            continue  # punch belongs to a different shift (or none at all)
 
         start_raw = p.get('startTimestamp')
         end_raw = p.get('endTimestamp')
@@ -521,12 +523,28 @@ def render_card(card, debug=False):
     debug_footer = ''
     if debug:
         matched_sid = card.get('matched_sid', 'none')
-        matched_ok = '✓' if matched_sid == v['sid'] else ('∅' if matched_sid == 'none' else '⚠︎ MISMATCH')
+        available = card.get('available_sids', [])
+        if matched_sid == v['sid']:
+            marker = '✓'
+        elif matched_sid == 'none':
+            marker = '∅ NO MATCH'
+        else:
+            marker = '⚠︎ MISMATCH'
+
+        # Format types so we can spot int/str confusion at a glance
+        shift_sid_display = f"{v['sid']} ({type(v['sid']).__name__})"
+        match_display = f"{matched_sid} ({type(matched_sid).__name__})"
+
+        avail_display = ''
+        if matched_sid == 'none' and available:
+            pairs = [f"{s} ({type(s).__name__})" for s in available]
+            avail_display = f'<br/>today\'s punches had eventShiftIds: {", ".join(pairs)}'
+
         debug_footer = (
             f'<div style="margin-top:8px; padding:6px 10px; background:rgba(0,0,0,0.4); '
-            f'border-radius:6px; font-family:JetBrains Mono,monospace; font-size:0.7rem; '
-            f'color:#94a3b8;">shift.id={v["sid"]}<br/>'
-            f'matched punch.eventShiftId={matched_sid} {matched_ok}</div>'
+            f'border-radius:6px; font-family:JetBrains Mono,monospace; font-size:0.68rem; '
+            f'color:#94a3b8; line-height:1.4;">shift.id={shift_sid_display}<br/>'
+            f'matched={match_display} {marker}{avail_display}</div>'
         )
 
     # Single-line HTML — no indentation or blank lines that would confuse
@@ -690,9 +708,26 @@ else:
             p = find_punch(user_punches, v, date_key)
             status, css, cin, cout = classify(v, p, now)
             counts[status] = counts.get(status, 0) + 1
+
+            # For debug: if no match, list the eventShiftIds present in this
+            # user's punches (scoped to today) so we can see what WAS available.
+            available_sids = []
+            if not p and user_punches:
+                for pp in user_punches:
+                    st_raw = pp.get('startTimestamp')
+                    if st_raw:
+                        try:
+                            dt = datetime.fromisoformat(
+                                st_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+                            if dt.date() == date_key:
+                                available_sids.append(pp.get('eventShiftId'))
+                        except Exception:
+                            pass
+
             cards.append({
                 'v': v, 'status': status, 'css': css, 'cin': cin, 'cout': cout,
                 'matched_sid': p.get('eventShiftId') if p else 'none',
+                'available_sids': available_sids,
             })
 
         cards.sort(key=lambda c: c['v']['start'])
