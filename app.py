@@ -237,14 +237,19 @@ def authenticate_headless(email, password):
             driver.quit()
 
 
-def safe_get_json(auth_dict, url, params=None):
+def safe_get_json(auth_dict, url, params=None, no_bearer=False):
+    """
+    no_bearer=True → drop the Authorization header and call with cookies only.
+    Used to test whether some endpoints reject the Cognito bearer token
+    (which has narrower scope than session cookies on some backends).
+    """
     sess = auth_dict['sess']
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
         'Referer': f'{BASE}/volunteer/',
     }
-    if auth_dict.get('token'):
+    if auth_dict.get('token') and not no_bearer:
         headers['Authorization'] = f"Bearer {auth_dict['token']}"
 
     try:
@@ -356,22 +361,23 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     if isinstance(attendance, str):
         attendance = []
 
-    # 2b. LIVE PRESENCE — two strategies, either one is enough:
+    # 2b. LIVE PRESENCE — multiple strategies, any one of which can succeed.
     #
-    #   Strategy A:  GET /events/{event_id}/presence
-    #       Direct endpoint. Reported 403 for volunteer tokens.
-    #
-    #   Strategy B:  GET /events/{event_id}/users?includeUsersPresence=true
-    #       Per OpenAPI spec, each user object in the response carries a `checkins`
-    #       array with the latest presence record. Since volunteers need to read
-    #       event rosters, this path has a better permission profile.
-    #
-    # We try BOTH and merge whatever comes back.
+    #   A) /events/{id}/presence                    (direct, documented — 403'd)
+    #   B) /events/{id}/users?includeUsersPresence  (embedded — 403'd)
+    #   C) SAME as A & B but with cookies only, no Bearer token. The scraper.py
+    #      proves cookies-only works for /shifts. Cognito token may have narrower
+    #      scope than the full session cookies.
+    #   D) /shifts?includeUsersPresence=true — UNDOCUMENTED. The spec's checkins
+    #      field says "Only visible if includeUsersPresence=true AND this URI
+    #      accepts this parameter". Maybe /shifts silently accepts it.
+    #   E) /events/{id}/users/{self_uid}?includeUsersPresence=true — can the
+    #      logged-in volunteer at least read their OWN presence? Pure diagnostic.
 
     presence_data = []
     presence_error = None
 
-    # Strategy A
+    # Strategy A — direct endpoint, bearer token (previously failed)
     pres_raw = safe_get_json(
         _auth_dict,
         f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/presence"
@@ -379,12 +385,9 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     if isinstance(pres_raw, list):
         presence_data.extend(pres_raw)
     else:
-        presence_error = pres_raw  # will try Strategy B
+        presence_error = pres_raw
 
-    # Strategy B — event users with presence embedded
-    # We make TWO calls so we can diagnose: one without the presence flag (does
-    # the endpoint work at all for this token?) and one with it (is the presence
-    # flag what's blocked?).
+    # Strategy B — embedded via /events/{id}/users
     eu_basic_raw = safe_get_json(
         _auth_dict,
         f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users",
@@ -402,25 +405,122 @@ def get_dashboard_data(_auth_dict, target_date_obj):
     if isinstance(eu_raw, list):
         extracted = 0
         for u in eu_raw:
-            # The 'checkins' array holds the presence records for this user
             checkins = u.get('checkins') or []
             uid = u.get('id') or u.get('eventUserAccountId')
             for ci in checkins:
-                # Normalize: presence records expect eventUserAccountId; some may
-                # only carry it at the parent user level.
                 if 'eventUserAccountId' not in ci and uid is not None:
                     ci['eventUserAccountId'] = uid
                 presence_data.append(ci)
                 extracted += 1
-        # If Strategy A failed but B succeeded, clear the error so the UI banner
-        # goes green.
         if extracted > 0 and presence_error:
             presence_error = None
     else:
         event_users_error = eu_raw
-        # If Strategy A also failed, surface the combined situation.
-        if presence_error and not presence_data:
-            presence_error = f"presence: {presence_error} | users?includeUsersPresence: {eu_raw}"
+
+    # Strategy C — cookies-only (drop the Bearer token)
+    c_presence_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/presence",
+        no_bearer=True,
+    )
+    c_presence_ok = isinstance(c_presence_raw, list)
+    c_presence_count = len(c_presence_raw) if c_presence_ok else 0
+    c_presence_error = None if c_presence_ok else c_presence_raw
+
+    c_users_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users",
+        {"includeUsersPresence": "true"},
+        no_bearer=True,
+    )
+    c_users_ok = isinstance(c_users_raw, list)
+    c_users_count = len(c_users_raw) if c_users_ok else 0
+    c_users_error = None if c_users_ok else c_users_raw
+
+    # If EITHER cookie-only call won, harvest presence and clear the error
+    if c_presence_ok and c_presence_raw:
+        presence_data.extend(c_presence_raw)
+        presence_error = None
+    if c_users_ok:
+        for u in c_users_raw:
+            checkins = u.get('checkins') or []
+            uid = u.get('id') or u.get('eventUserAccountId')
+            for ci in checkins:
+                if 'eventUserAccountId' not in ci and uid is not None:
+                    ci['eventUserAccountId'] = uid
+                presence_data.append(ci)
+        if presence_error:
+            presence_error = None
+
+    # Strategy D — undocumented: try includeUsersPresence on /shifts
+    d_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts",
+        {
+            "includeShiftRoles": "true",
+            "includeShiftUsers": "true",
+            "includeUsersPresence": "true",
+            "take": 500,
+        }
+    )
+    d_ok = isinstance(d_raw, list)
+    d_checkin_hits = 0
+    d_error = None if d_ok else d_raw
+    if d_ok:
+        for sh in d_raw:
+            for role in sh.get('roles', []):
+                for u in role.get('users', []):
+                    checkins = u.get('checkins') or []
+                    for ci in checkins:
+                        if 'eventUserAccountId' not in ci:
+                            ci['eventUserAccountId'] = u.get('id')
+                        presence_data.append(ci)
+                        d_checkin_hits += 1
+        if d_checkin_hits > 0 and presence_error:
+            presence_error = None
+
+    # Strategy E — can the logged-in user read THEIR OWN presence?
+    # Try to extract the self user id from the bearer token payload.
+    self_uid = None
+    tok = _auth_dict.get('token') or ''
+    if tok.count('.') == 2:
+        try:
+            import base64, json as _j
+            payload = tok.split('.')[1]
+            payload += '=' * (-len(payload) % 4)
+            claims = _j.loads(base64.urlsafe_b64decode(payload))
+            # Common Cognito claim keys for user id
+            for k in ('custom:userAccountId', 'userAccountId', 'custom:user_id', 'sub'):
+                if k in claims:
+                    try:
+                        self_uid = int(claims[k])
+                        break
+                    except (ValueError, TypeError):
+                        self_uid = claims[k]
+                        break
+        except Exception:
+            pass
+
+    e_raw = None
+    e_error = None
+    e_ok = False
+    if self_uid:
+        e_raw = safe_get_json(
+            _auth_dict,
+            f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users/{self_uid}",
+            {"includeUsersPresence": "true"}
+        )
+        e_ok = isinstance(e_raw, dict)
+        e_error = None if e_ok else e_raw
+        if e_ok:
+            checkins = e_raw.get('checkins') or []
+            uid = e_raw.get('id') or e_raw.get('eventUserAccountId') or self_uid
+            for ci in checkins:
+                if 'eventUserAccountId' not in ci:
+                    ci['eventUserAccountId'] = uid
+                presence_data.append(ci)
+            if checkins and presence_error:
+                presence_error = None
 
     raw_people = []
     uids = set()
@@ -552,6 +652,22 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "eu_basic_count": eu_basic_count,
         "eu_basic_error": eu_basic_error,
         "eu_sample": eu_raw if isinstance(eu_raw, list) and eu_raw else None,
+        # Strategy C (cookies only)
+        "c_presence_ok": c_presence_ok,
+        "c_presence_count": c_presence_count,
+        "c_presence_error": c_presence_error,
+        "c_users_ok": c_users_ok,
+        "c_users_count": c_users_count,
+        "c_users_error": c_users_error,
+        # Strategy D (shifts with undocumented flag)
+        "d_ok": d_ok,
+        "d_checkin_hits": d_checkin_hits,
+        "d_error": d_error,
+        # Strategy E (self read)
+        "self_uid": self_uid,
+        "e_ok": e_ok,
+        "e_error": e_error,
+        "e_sample": e_raw if e_ok else None,
     }
     return final_roster, punch_map, meta
 
@@ -642,74 +758,126 @@ if st.session_state.auth_data:
             st.success(
                 f"✓ Live presence feed active — {len(presence_list)} presence records loaded."
             )
-        # ── Debug panel (if enabled) — show raw serviceTime for users on in-progress shifts ──
+        # ── Debug panel (if enabled) ──
         if st.session_state.get("debug_mode"):
             import json as _json
 
-            event_users_error = meta.get("event_users_error")
-            eu_basic_ok = meta.get("eu_basic_ok")
-            eu_basic_count = meta.get("eu_basic_count", 0)
-            eu_basic_error = meta.get("eu_basic_error")
-            eu_sample = meta.get("eu_sample")
-
-            st.markdown('<div class="section-header">🔬 Debug — Live Presence Sources</div>',
+            st.markdown('<div class="section-header">🔬 Debug — Presence Strategy Matrix</div>',
                         unsafe_allow_html=True)
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.write("**A: `/events/{id}/presence`**")
-                if presence_error and not presence_list:
-                    st.error(f"`{str(presence_error)[:120]}`")
-                else:
-                    st.success("OK")
+            def result_row(label, desc, ok, count_str, err):
+                c1, c2 = st.columns([1, 3])
+                with c1:
+                    if ok:
+                        st.success(f"✓ {label}")
+                    else:
+                        st.error(f"✗ {label}")
+                with c2:
+                    st.caption(desc)
+                    if ok:
+                        st.write(f"→ **{count_str}**")
+                    else:
+                        st.code(str(err)[:150], language=None)
 
-            with col2:
-                st.write("**B1: `/events/{id}/users`** (no presence flag)")
-                if eu_basic_ok:
-                    st.success(f"OK — {eu_basic_count} users")
-                else:
-                    st.error(f"`{str(eu_basic_error)[:120]}`")
+            # A
+            result_row(
+                "A",
+                "`GET /events/{id}/presence`  — direct endpoint, with Bearer token",
+                not (presence_error and not meta.get("presence")),
+                f"{len(meta.get('presence', []))} records" if meta.get("presence") else "no data",
+                presence_error,
+            )
+            # B1
+            result_row(
+                "B1",
+                "`GET /events/{id}/users`  — with Bearer token, no presence flag (baseline reachability)",
+                meta.get("eu_basic_ok"),
+                f"{meta.get('eu_basic_count', 0)} users",
+                meta.get("eu_basic_error"),
+            )
+            # B2
+            result_row(
+                "B2",
+                "`GET /events/{id}/users?includeUsersPresence=true`  — with Bearer token",
+                not meta.get("event_users_error"),
+                "OK",
+                meta.get("event_users_error"),
+            )
+            # C1
+            result_row(
+                "C1",
+                "`GET /events/{id}/presence`  — **cookies only, no Bearer token**",
+                meta.get("c_presence_ok"),
+                f"{meta.get('c_presence_count', 0)} records",
+                meta.get("c_presence_error"),
+            )
+            # C2
+            result_row(
+                "C2",
+                "`GET /events/{id}/users?includeUsersPresence=true`  — **cookies only**",
+                meta.get("c_users_ok"),
+                f"{meta.get('c_users_count', 0)} users",
+                meta.get("c_users_error"),
+            )
+            # D
+            result_row(
+                "D",
+                "`GET /events/{id}/shifts?includeUsersPresence=true`  — **undocumented flag on shifts**",
+                meta.get("d_ok"),
+                f"endpoint OK; checkins found: {meta.get('d_checkin_hits', 0)}",
+                meta.get("d_error"),
+            )
+            # E
+            self_uid_val = meta.get("self_uid")
+            result_row(
+                "E",
+                f"`GET /events/{{id}}/users/{{SELF}}?includeUsersPresence=true`  "
+                f"— can I read my OWN presence? (self_uid={self_uid_val or 'unknown'})",
+                meta.get("e_ok"),
+                "self record returned",
+                meta.get("e_error") if self_uid_val else "Could not extract self_uid from token",
+            )
 
-            with col3:
-                st.write("**B2: `...users?includeUsersPresence=true`**")
-                if event_users_error:
-                    st.error(f"`{str(event_users_error)[:120]}`")
-                else:
-                    st.success("OK")
+            st.divider()
+            st.write(f"**Total presence records merged from all strategies: {len(presence_list)}**")
 
-            # Interpretation hints — key question is whether B1 works
-            if eu_basic_ok and event_users_error:
-                st.info(
-                    "📍 The users endpoint IS reachable for your token, but the "
-                    "`includeUsersPresence` flag specifically is blocked. This suggests "
-                    "presence data requires elevated permissions."
+            # Interpretation
+            any_won = any([
+                meta.get("presence"),
+                meta.get("c_presence_ok") and meta.get("c_presence_count", 0) > 0,
+                meta.get("c_users_ok"),
+                meta.get("d_checkin_hits", 0) > 0,
+                meta.get("e_ok"),
+            ])
+            if any_won:
+                st.success("🎉 At least one strategy produced usable data.")
+            else:
+                st.error(
+                    "❌ All 5 strategies failed or returned nothing. Volunteer-level "
+                    "tokens appear to be fully walled off from presence data via the public API. "
+                    "Either escalate to an admin API key for Lucky Dog's Bloomerang account, "
+                    "or pivot the dashboard to schedule + completed-shifts only."
                 )
-            elif eu_basic_ok and not event_users_error:
-                st.info(
-                    "📍 Both the users endpoint AND the presence flag work. "
-                    f"Currently {len(presence_list)} presence records merged — "
-                    "if this is 0, no one is checked in right now, which is expected "
-                    "when no shifts are active."
-                )
-            elif not eu_basic_ok:
-                st.info(
-                    "📍 The users endpoint itself is blocked for your token, not "
-                    "just presence. This is a broader permission restriction."
-                )
 
-            st.write(f"**Total presence records merged: {len(presence_list)}**")
             if presence_list:
-                with st.expander(f"View all {len(presence_list)} presence records"):
+                with st.expander(f"View all {len(presence_list)} merged presence records"):
                     st.json(presence_list)
 
-            # If B2 succeeded, show a sample user to confirm the shape
-            if eu_sample:
-                with st.expander(f"Sample event-user object (first of {len(eu_sample)})"):
-                    sample = eu_sample[0].copy()
-                    # Redact PII since we're just checking structure
+            if meta.get("eu_sample"):
+                with st.expander("Sample event-user object (B2 response)"):
+                    sample = meta["eu_sample"][0].copy()
                     for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
                         if k in sample:
                             sample[k] = '[redacted]'
+                    st.json(sample)
+
+            if meta.get("e_sample"):
+                with st.expander("Self user object (E response — check for `checkins` field)"):
+                    sample = meta["e_sample"].copy() if isinstance(meta["e_sample"], dict) else meta["e_sample"]
+                    if isinstance(sample, dict):
+                        for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                            if k in sample:
+                                sample[k] = '[redacted]'
                     st.json(sample)
 
             in_progress = [v for v in roster
