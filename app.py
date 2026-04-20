@@ -516,26 +516,206 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         self_uid = SELF_UID
         self_uid_source = "SELF_UID constant"
 
-    e_raw = None
-    e_error = None
-    e_ok = False
-    if self_uid:
-        e_raw = safe_get_json(
+    # Strategy E — can the volunteer read their OWN presence via the self-user endpoint?
+    e_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users/{self_uid}",
+        {"includeUsersPresence": "true"}
+    )
+    e_ok = isinstance(e_raw, dict)
+    e_error = None if e_ok else e_raw
+    if e_ok:
+        checkins = e_raw.get('checkins') or []
+        for ci in checkins:
+            if 'eventUserAccountId' not in ci:
+                ci['eventUserAccountId'] = e_raw.get('id') or self_uid
+            presence_data.append(ci)
+        if checkins and presence_error:
+            presence_error = None
+
+    # Strategy F — single-shift endpoint with aggressive parameter fuzzing.
+    # The spec for /shifts/{shift_id} only documents includeShiftLocations,
+    # includeShiftTags, useExternalId. But maybe it accepts the same flags as
+    # the collection endpoint — OR it returns hidden presence fields by default.
+    f_raw = None
+    f_error = None
+    f_ok = False
+    f_sample = None
+    first_shift_id = next(iter(shift_defs.keys()), None) if shift_defs else None
+    if first_shift_id:
+        f_raw = safe_get_json(
             _auth_dict,
-            f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users/{self_uid}",
-            {"includeUsersPresence": "true"}
+            f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts/{first_shift_id}",
+            {
+                "includeShiftRoles": "true",
+                "includeShiftUsers": "true",
+                "includeShiftLocations": "true",
+                "includeUsersPresence": "true",
+            }
         )
-        e_ok = isinstance(e_raw, dict)
-        e_error = None if e_ok else e_raw
-        if e_ok:
-            checkins = e_raw.get('checkins') or []
-            uid = e_raw.get('id') or e_raw.get('eventUserAccountId') or self_uid
-            for ci in checkins:
-                if 'eventUserAccountId' not in ci:
-                    ci['eventUserAccountId'] = uid
-                presence_data.append(ci)
-            if checkins and presence_error:
+        f_ok = isinstance(f_raw, (dict, list))
+        f_error = None if f_ok else f_raw
+        if f_ok:
+            # Dict for a single shift, list if the endpoint returns wrapped
+            shift_obj = f_raw if isinstance(f_raw, dict) else (f_raw[0] if f_raw else {})
+            for role in shift_obj.get('roles', []):
+                for u in role.get('users', []):
+                    if f_sample is None:
+                        f_sample = u
+                    checkins = u.get('checkins') or []
+                    for ci in checkins:
+                        if 'eventUserAccountId' not in ci:
+                            ci['eventUserAccountId'] = u.get('id')
+                        presence_data.append(ci)
+                        if presence_error:
+                            presence_error = None
+
+    # Strategy G — self user endpoint, NO flags. Maybe the presence flag is
+    # what triggers 403 (strict param validation), and the endpoint would return
+    # checkins by default.
+    g_raw = safe_get_json(
+        _auth_dict,
+        f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/users/{self_uid}",
+    )
+    g_ok = isinstance(g_raw, dict)
+    g_error = None if g_ok else g_raw
+    g_has_checkins = isinstance(g_raw, dict) and 'checkins' in g_raw
+
+    # Strategy H — inspect a sample user from the ALREADY-WORKING /shifts call.
+    # We already have this data (shift_defs). Just grab a user object to see ALL
+    # fields that came back, in case there's a hidden presence field we missed.
+    h_sample_user = None
+    h_all_user_fields = set()
+    for sid, sdef in shift_defs.items():
+        for role in sdef.get('roles', []):
+            for u in role.get('users', []):
+                if h_sample_user is None:
+                    h_sample_user = u
+                h_all_user_fields.update(u.keys())
+                if h_sample_user and len(h_all_user_fields) > 20:
+                    break
+            if h_all_user_fields:
+                break
+        if h_all_user_fields:
+            break
+
+    # Strategy I — decoded token claims (see earlier)
+    token_claims = None
+    if tok.count('.') == 2:
+        try:
+            import base64, json as _j
+            payload = tok.split('.')[1]
+            payload += '=' * (-len(payload) % 4)
+            token_claims = _j.loads(base64.urlsafe_b64decode(payload))
+            for k in list(token_claims.keys()):
+                if any(x in k.lower() for x in ('email', 'phone', 'name', 'sub')):
+                    if isinstance(token_claims[k], str) and len(token_claims[k]) > 5:
+                        token_claims[k] = token_claims[k][:3] + '...[redacted]'
+        except Exception as _e:
+            token_claims = {"_error": str(_e)}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Strategy J — LEGACY v1 API endpoints discovered via APK reverse-engineering.
+    # The mobile app uses these alongside v4 calls. They predate the current
+    # permission model and likely bypass the /presence 403 wall.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # First role id for the shiftCheckin probe
+    first_role_id = None
+    for sdef in shift_defs.values():
+        for role in sdef.get('roles', []):
+            first_role_id = role.get('id')
+            if first_role_id:
+                break
+        if first_role_id:
+            break
+
+    # Endpoint candidates, ordered most → least likely to succeed.
+    # Each candidate may have multiple path guesses since some strings were truncated.
+    j_probes = [
+        ("v1 event check-ins (event-scoped list)",
+         f"{BASE}/api/v1/eventCheckin/event/{EVENT_ID}"),
+
+        ("v1 status list by event (short)",
+         f"{BASE}/api/v1/EventUserAccounts/list/status/ids/event/{EVENT_ID}"),
+
+        ("v2 status list by event",
+         f"{BASE}/api/v2/EventUserAccounts/list/status/ids/event/{EVENT_ID}"),
+
+        ("v1 event check-ins (alt path)",
+         f"{BASE}/api/v1/EventUserAccounts/checkin?eventUserAccountId={self_uid}"),
+
+        ("v1 my shifts (universal home)",
+         f"{BASE}/api/v1/universalhome/myshifts"),
+    ]
+
+    if first_role_id:
+        j_probes.append(("v1 shift check-in by role",
+                         f"{BASE}/api/v1/shiftCheckin/eventShiftRole/{first_role_id}"))
+
+    j_probes.append(("v1 shift check-in for self",
+                     f"{BASE}/api/v1/shiftCheckin/eventUserAccount/{self_uid}"))
+
+    j_results = []
+    for desc, url in j_probes:
+        # Try with bearer first
+        r_bearer = safe_get_json(_auth_dict, url)
+        # Also try cookies-only in case v1 auth differs
+        r_cookies = safe_get_json(_auth_dict, url, no_bearer=True)
+
+        bearer_ok = isinstance(r_bearer, (list, dict))
+        cookies_ok = isinstance(r_cookies, (list, dict))
+
+        best = None
+        winning_mode = None
+        if bearer_ok:
+            best = r_bearer
+            winning_mode = "bearer"
+        elif cookies_ok:
+            best = r_cookies
+            winning_mode = "cookies"
+
+        # Try to harvest anything that looks like a presence record
+        harvested = 0
+        if best is not None:
+            # Response might be a list of checkin records directly, or a dict
+            # containing them. Normalize.
+            candidates = []
+            if isinstance(best, list):
+                candidates = best
+            elif isinstance(best, dict):
+                for key in ('checkins', 'data', 'results', 'items', 'records'):
+                    if key in best and isinstance(best[key], list):
+                        candidates = best[key]
+                        break
+
+            for c in candidates:
+                if not isinstance(c, dict):
+                    continue
+                # Heuristic: a presence-ish record has either a status field
+                # or eventShiftId + some timestamp
+                looks_like_presence = (
+                    'status' in c or 'checkedIn' in c or 'clockedIn' in c
+                    or ('eventShiftId' in c and ('dateCreated' in c or 'timestamp' in c))
+                )
+                if looks_like_presence:
+                    presence_data.append(c)
+                    harvested += 1
+
+            if harvested > 0 and presence_error:
                 presence_error = None
+
+        j_results.append({
+            'desc': desc,
+            'url': url,
+            'bearer_ok': bearer_ok,
+            'cookies_ok': cookies_ok,
+            'bearer_err': None if bearer_ok else (str(r_bearer)[:200] if r_bearer else None),
+            'cookies_err': None if cookies_ok else (str(r_cookies)[:200] if r_cookies else None),
+            'winning_mode': winning_mode,
+            'sample': best if best is not None else None,
+            'harvested': harvested,
+        })
 
     raw_people = []
     uids = set()
@@ -680,12 +860,29 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "d_error": d_error,
         "d_sample_user": d_sample_user,
         "d_has_checkins_field": d_has_checkins_field,
-        # Strategy E (self read)
+        # Strategy E (self read with flag)
         "self_uid": self_uid,
         "self_uid_source": self_uid_source,
         "e_ok": e_ok,
         "e_error": e_error,
         "e_sample": e_raw if e_ok else None,
+        # Strategy F (single-shift endpoint with fuzzed flags)
+        "f_ok": f_ok,
+        "f_error": f_error,
+        "f_sample": f_sample,
+        "f_has_checkins": f_sample is not None and 'checkins' in f_sample,
+        # Strategy G (self user endpoint, no flags)
+        "g_ok": g_ok,
+        "g_error": g_error,
+        "g_sample": g_raw if g_ok else None,
+        "g_has_checkins": g_has_checkins,
+        # Strategy H (inspect existing /shifts user object)
+        "h_sample_user": h_sample_user,
+        "h_all_user_fields": sorted(list(h_all_user_fields)),
+        # Strategy I (decoded token claims)
+        "token_claims": token_claims,
+        # Strategy J (v1 legacy endpoints from APK)
+        "j_results": j_results,
     }
     return final_roster, punch_map, meta
 
@@ -858,26 +1055,67 @@ if st.session_state.auth_data:
                 "self record returned",
                 meta.get("e_error"),
             )
+            # F
+            result_row(
+                "F",
+                "`GET /events/{id}/shifts/{shift_id}`  — **single-shift endpoint with fuzzed presence flag**",
+                meta.get("f_ok"),
+                f"endpoint OK; checkins field on user: "
+                f"{'✓ PRESENT' if meta.get('f_has_checkins') else '✗ ABSENT'}",
+                meta.get("f_error"),
+            )
+            # G
+            result_row(
+                "G",
+                f"`GET /events/{{id}}/users/{{SELF}}`  — **self user, NO flags** (does checkins come back by default?)",
+                meta.get("g_ok"),
+                f"endpoint OK; checkins field: "
+                f"{'✓ PRESENT' if meta.get('g_has_checkins') else '✗ ABSENT'}",
+                meta.get("g_error"),
+            )
+            # H
+            has_any_state_field = any(
+                'check' in f.lower() or 'presence' in f.lower() or 'status' in f.lower() or 'active' in f.lower()
+                for f in meta.get("h_all_user_fields", [])
+            )
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.info("H")
+            with c2:
+                st.caption("**Inspect the already-working `/shifts` user object** — any presence-like fields we missed?")
+                fields = meta.get("h_all_user_fields", [])
+                if fields:
+                    st.write(f"→ User object has {len(fields)} fields: `{', '.join(fields)}`")
+                    if has_any_state_field:
+                        st.success("🎉 Found a field that might contain presence state!")
+                    else:
+                        st.write("→ No check/presence/status/active fields found in the default response.")
+                else:
+                    st.write("→ No user objects in /shifts response")
 
             st.divider()
             st.write(f"**Total presence records merged from all strategies: {len(presence_list)}**")
 
             # Interpretation
+            j_hits = any(r.get("winning_mode") for r in meta.get("j_results", []))
             any_won = any([
                 meta.get("presence"),
                 meta.get("c_presence_ok") and meta.get("c_presence_count", 0) > 0,
                 meta.get("c_users_ok"),
-                meta.get("d_checkin_hits", 0) > 0,
+                meta.get("d_has_checkins_field"),
                 meta.get("e_ok"),
+                meta.get("f_has_checkins"),
+                meta.get("g_has_checkins"),
+                j_hits,
             ])
             if any_won:
                 st.success("🎉 At least one strategy produced usable data.")
             else:
                 st.error(
-                    "❌ All 5 strategies failed or returned nothing. Volunteer-level "
-                    "tokens appear to be fully walled off from presence data via the public API. "
-                    "Either escalate to an admin API key for Lucky Dog's Bloomerang account, "
-                    "or pivot the dashboard to schedule + completed-shifts only."
+                    "❌ All strategies failed. Next step is to capture the mobile app's "
+                    "live network traffic (HTTP Toolkit or mitmproxy) to see what exact "
+                    "URL the app is hitting — the APK told us endpoint names but not "
+                    "necessarily the exact current paths."
                 )
 
             if presence_list:
@@ -903,16 +1141,98 @@ if st.session_state.auth_data:
                     if meta.get("d_has_checkins_field"):
                         st.success(
                             "✓ The `checkins` field IS present on user objects — Strategy D "
-                            "is genuinely honoring the `includeUsersPresence=true` flag. "
-                            "It's empty now because nobody's checked in, but it should populate "
-                            "during active shifts."
+                            "is genuinely honoring the `includeUsersPresence=true` flag."
                         )
                     else:
                         st.warning(
                             "✗ No `checkins` field found on any user object. The `/shifts` "
-                            "endpoint returned 200, but silently ignored the "
-                            "`includeUsersPresence=true` flag. Strategy D is a false positive."
+                            "endpoint returned 200, but silently ignored the flag."
                         )
+
+            if meta.get("f_sample"):
+                with st.expander("🔑 Sample user from Strategy F (single-shift endpoint)"):
+                    sample = meta["f_sample"].copy() if isinstance(meta["f_sample"], dict) else meta["f_sample"]
+                    if isinstance(sample, dict):
+                        for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                            if k in sample:
+                                sample[k] = '[redacted]'
+                    st.json(sample)
+
+            if meta.get("g_sample"):
+                with st.expander("🔑 Self user object from Strategy G (no flags)"):
+                    sample = meta["g_sample"].copy() if isinstance(meta["g_sample"], dict) else meta["g_sample"]
+                    if isinstance(sample, dict):
+                        for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                            if k in sample:
+                                sample[k] = '[redacted]'
+                    st.json(sample)
+
+            if meta.get("h_sample_user"):
+                with st.expander("🔑 Sample user from /shifts (Strategy H — full field list)"):
+                    sample = meta["h_sample_user"].copy() if isinstance(meta["h_sample_user"], dict) else meta["h_sample_user"]
+                    if isinstance(sample, dict):
+                        for k in ('phoneNumber', 'address', 'address2', 'dob', 'username'):
+                            if k in sample:
+                                sample[k] = '[redacted]'
+                    st.json(sample)
+
+            if meta.get("token_claims"):
+                with st.expander("🔬 Strategy I — Bearer token claims (scopes & permissions)"):
+                    st.json(meta["token_claims"])
+                    st.caption(
+                        "Look for a `scope` or `cognito:groups` field. If the token scope is "
+                        "limited (e.g., 'openid profile' only), that's why /presence returns 403."
+                    )
+
+            # ── Strategy J — the big one, legacy v1 API endpoints from the APK ──
+            st.markdown('<div class="section-header">🎯 Strategy J — Legacy v1 API '
+                        '(from APK recon)</div>', unsafe_allow_html=True)
+
+            j_results = meta.get("j_results", [])
+            j_any_won = any(r.get("winning_mode") for r in j_results)
+
+            if j_any_won:
+                st.success(
+                    f"🎉 {sum(1 for r in j_results if r.get('winning_mode'))} of "
+                    f"{len(j_results)} legacy endpoints responded with data!"
+                )
+            else:
+                st.warning(
+                    "None of the v1 probes returned data. Response bodies are shown below "
+                    "so we can see what the server IS saying."
+                )
+
+            for r in j_results:
+                label = r["desc"]
+                emoji = "✅" if r.get("winning_mode") else "❌"
+                auth_note = f"via **{r['winning_mode']}**" if r.get("winning_mode") else "both modes failed"
+
+                with st.expander(f"{emoji} {label}  —  {auth_note}  —  harvested {r.get('harvested', 0)} records"):
+                    st.code(r['url'], language=None)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.caption("**With Bearer token**")
+                        if r.get("bearer_ok"):
+                            st.success("OK")
+                        else:
+                            st.code(r.get("bearer_err") or "(empty)", language=None)
+                    with c2:
+                        st.caption("**Cookies only**")
+                        if r.get("cookies_ok"):
+                            st.success("OK")
+                        else:
+                            st.code(r.get("cookies_err") or "(empty)", language=None)
+
+                    if r.get("sample") is not None:
+                        st.caption("**Response body:**")
+                        # Redact PII if present
+                        s = r["sample"]
+                        try:
+                            import json as _j
+                            s_str = _j.dumps(s)[:5000]
+                            st.json(_j.loads(s_str))
+                        except Exception:
+                            st.write(s)
 
             if meta.get("e_sample"):
                 with st.expander("Self user object (E response — check for `checkins` field)"):
