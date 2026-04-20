@@ -385,49 +385,51 @@ def build_roster(shifts_raw, target_dates):
 
 def find_punch(user_punches, shift_info, t_date):
     """
-    Pick the most relevant serviceTime record for this shift on this date.
-    Priority: exact shift+date match (real punches) > exact shift (manager-fix)
-    > fuzzy time match within ±90 min.
+    Pick the serviceTime record for this shift on this date.
+
+    Bloomerang stamps every serviceTime record with the eventShiftId it was
+    logged against. That field is the authoritative link — a punch belongs
+    to one and only one shift. We never guess by time proximity.
+
+    Priority:
+      1. Real punches (startTimestamp present) with matching eventShiftId + date
+      2. Manager-fix entries (both timestamps null) with matching eventShiftId + date
     """
     if not user_punches:
         return None
 
     sid = shift_info['sid']
-    s_start, s_end = shift_info['start'], shift_info['end']
+    iso_day = t_date.isoformat()
 
-    exact_real, exact_fixed, fuzzy = [], [], []
+    exact_real, exact_fixed = [], []
 
     for p in user_punches:
+        if p.get('eventShiftId') != sid:
+            continue  # punch belongs to a different shift
+
         start_raw = p.get('startTimestamp')
         end_raw = p.get('endTimestamp')
-        same_shift = p.get('eventShiftId') == sid
 
-        # Manager-fix (both null) — only accept for exact shift + day match
+        # Manager-fix entry — no timestamps, just credited hours. Verify day.
         if not start_raw and not end_raw:
-            day = p.get('dayDate', '')
-            if same_shift and day.startswith(t_date.isoformat()):
+            if p.get('dayDate', '').startswith(iso_day):
                 exact_fixed.append(p)
             continue
 
+        # Real punch — verify the clock-in actually falls on this date
         if not start_raw:
             continue
-
         try:
             p_start = datetime.fromisoformat(
                 start_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
         except Exception:
             continue
 
-        if p_start.date() != t_date:
-            continue
-
-        if same_shift:
+        if p_start.date() == t_date:
             exact_real.append(p)
-        elif s_start - timedelta(minutes=90) <= p_start <= s_end + timedelta(minutes=90):
-            fuzzy.append(p)
 
-    # Prefer exact-real > exact-fixed > fuzzy. Within a bucket, newest wins.
-    for bucket in (exact_real, exact_fixed, fuzzy):
+    # Real punches win over manager-fixes; within a bucket, newest startTimestamp wins
+    for bucket in (exact_real, exact_fixed):
         if bucket:
             return max(bucket, key=lambda p: p.get('startTimestamp', '') or p.get('dayDate', ''))
 
