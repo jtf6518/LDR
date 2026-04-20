@@ -737,6 +737,12 @@ def get_dashboard_data(_auth_dict, target_date_obj):
         "https://api.initlive.com",
         "https://api-prod.initlive.com",
         "https://api.bloomerang.co",
+        # Based on "Live" being an env name found in the APK
+        "https://api-live.initlive.com",
+        "https://live.initlive.com",
+        # Bloomerang variants
+        "https://volunteer-api.bloomerang.co",
+        "https://api-volunteer.bloomerang.co",
     ]
     # Use the most likely-to-exist path as our probe
     probe_path = f"/api/v1/eventCheckin/event/{EVENT_ID}"
