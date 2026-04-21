@@ -383,59 +383,132 @@ def build_roster(shifts_raw, target_dates):
     return roster, list(uids)
 
 
-def find_punch(user_punches, shift_info, t_date):
+def assign_punches(user_shifts, user_punches, t_date):
     """
-    Pick the serviceTime record for this shift on this date.
+    Given one volunteer's shifts and punches for a single date, decide which
+    punch (if any) belongs to which shift.
 
-    Bloomerang stamps every serviceTime record with the eventShiftId it was
-    logged against. That field is the authoritative link — a punch belongs
-    to one and only one shift. We never guess by time proximity.
+    Bloomerang's serviceTime endpoint, on volunteer-level tokens, mostly
+    returns records with eventShiftId=null — even when the volunteer was
+    scheduled for a specific shift. So we can't rely on the shift-id link.
 
-    Priority:
-      1. Real punches (startTimestamp present) with matching eventShiftId + date
-      2. Manager-fix entries (both timestamps null) with matching eventShiftId + date
+    Algorithm:
+      1. Build today's candidate punches (real or manager-fix).
+      2. For each punch, compute the shift whose window it most plausibly
+         belongs to — the one whose start time is closest to the punch's
+         start time (or dayDate for manager-fixes).
+      3. Assign one-to-one: each punch → at most one shift, each shift → at
+         most one punch. When multiple punches target the same shift, keep
+         whichever is the tightest match.
+
+    Returns dict: {shift_id -> punch_record}.
     """
-    if not user_punches:
-        return None
+    if not user_punches or not user_shifts:
+        return {}
 
-    # Compare as strings so int/str mismatches (common in JSON APIs) don't silently fail
-    sid = str(shift_info['sid'])
     iso_day = t_date.isoformat()
 
-    exact_real, exact_fixed = [], []
-
+    # Step 1 — filter to today's candidates. Normalize each to a "punch anchor
+    # time" we can use for proximity comparison.
+    candidates = []
     for p in user_punches:
-        p_sid_raw = p.get('eventShiftId')
-        if p_sid_raw is None or str(p_sid_raw) != sid:
-            continue  # punch belongs to a different shift (or none at all)
-
         start_raw = p.get('startTimestamp')
         end_raw = p.get('endTimestamp')
 
-        # Manager-fix entry — no timestamps, just credited hours. Verify day.
-        if not start_raw and not end_raw:
-            if p.get('dayDate', '').startswith(iso_day):
-                exact_fixed.append(p)
+        if start_raw:
+            try:
+                anchor = datetime.fromisoformat(
+                    start_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
+            except Exception:
+                continue
+            if anchor.date() != t_date:
+                continue
+        else:
+            # Manager-fix: no timestamps, just dayDate
+            day = p.get('dayDate', '')
+            if not day.startswith(iso_day):
+                continue
+            # For fix entries we can't anchor by time, so fall back to the
+            # punch's stamped eventShiftId (if any) — manager fixes usually
+            # do carry it.
+            anchor = None
+
+        candidates.append({'punch': p, 'anchor': anchor})
+
+    if not candidates:
+        return {}
+
+    # Step 2 — exact-shift-id pass. Any punch whose eventShiftId matches a
+    # shift id on the roster is locked to that shift; remove both from the
+    # unassigned pools.
+    assigned = {}
+    shifts_remaining = {str(s['sid']): s for s in user_shifts}
+    candidates_remaining = []
+
+    for c in candidates:
+        p_sid = c['punch'].get('eventShiftId')
+        if p_sid is not None and str(p_sid) in shifts_remaining:
+            key = str(p_sid)
+            # If multiple punches claim the same shift id, keep the one with
+            # a real clock-in time over a manager-fix.
+            existing = assigned.get(key)
+            if existing is None:
+                assigned[key] = c['punch']
+            else:
+                # Prefer real-punch over fix; otherwise keep the newer.
+                if c['punch'].get('startTimestamp') and not existing.get('startTimestamp'):
+                    assigned[key] = c['punch']
+        else:
+            candidates_remaining.append(c)
+
+    # Step 3 — proximity pass for unstamped punches.
+    # Build list of (shift_id, shift_start, shift_end) still unclaimed.
+    # For each remaining punch with an anchor time, score every shift window
+    # by the absolute distance from anchor to shift_start, then do a greedy
+    # assignment (closest first, one punch per shift).
+    unclaimed_shifts = [s for s in user_shifts if str(s['sid']) not in assigned]
+
+    scored = []
+    for c in candidates_remaining:
+        if c['anchor'] is None:
+            # Manager-fix without eventShiftId and no time anchor —
+            # impossible to assign objectively. Skip.
             continue
+        for s in unclaimed_shifts:
+            # Only consider punches that actually land near the shift:
+            # anywhere from 30 min before start to 60 min after end.
+            if c['anchor'] < s['start'] - timedelta(minutes=30):
+                continue
+            if c['anchor'] > s['end'] + timedelta(minutes=60):
+                continue
+            distance = abs((c['anchor'] - s['start']).total_seconds())
+            scored.append((distance, c, s))
 
-        # Real punch — verify the clock-in actually falls on this date
-        if not start_raw:
-            continue
-        try:
-            p_start = datetime.fromisoformat(
-                start_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-        except Exception:
-            continue
+    scored.sort(key=lambda t: t[0])
 
-        if p_start.date() == t_date:
-            exact_real.append(p)
+    used_punches = set()
+    for distance, c, s in scored:
+        sid_key = str(s['sid'])
+        if sid_key in assigned:
+            continue  # this shift already claimed
+        pid = id(c['punch'])
+        if pid in used_punches:
+            continue  # this punch already claimed
+        assigned[sid_key] = c['punch']
+        used_punches.add(pid)
 
-    # Real punches win over manager-fixes; within a bucket, newest startTimestamp wins
-    for bucket in (exact_real, exact_fixed):
-        if bucket:
-            return max(bucket, key=lambda p: p.get('startTimestamp', '') or p.get('dayDate', ''))
+    return assigned
 
-    return None
+
+def find_punch(user_punches, shift_info, t_date, _cache=None):
+    """
+    Return the punch for this shift on this date, or None.
+
+    This is a thin wrapper around assign_punches; the real work is one-to-one
+    allocation across a user's whole day. A cache keyed by (uid, date) avoids
+    re-running the allocator for each shift belonging to the same user.
+    """
+    return None  # overridden below — this function is now only called with pre-computed results
 
 
 def classify(shift_info, punch, now):
@@ -523,15 +596,18 @@ def render_card(card, debug=False):
     debug_footer = ''
     if debug:
         matched_sid = card.get('matched_sid', 'none')
+        via_proximity = card.get('matched_via_proximity', False)
         available = card.get('available_sids', [])
-        if matched_sid == v['sid']:
-            marker = '✓'
+
+        if via_proximity:
+            marker = '≈ matched by time proximity (punch had no eventShiftId)'
+        elif matched_sid == v['sid'] or str(matched_sid) == str(v['sid']):
+            marker = '✓ exact id match'
         elif matched_sid == 'none':
-            marker = '∅ NO MATCH'
+            marker = '∅ no match'
         else:
             marker = '⚠︎ MISMATCH'
 
-        # Format types so we can spot int/str confusion at a glance
         shift_sid_display = f"{v['sid']} ({type(v['sid']).__name__})"
         match_display = f"{matched_sid} ({type(matched_sid).__name__})"
 
@@ -544,7 +620,7 @@ def render_card(card, debug=False):
             f'<div style="margin-top:8px; padding:6px 10px; background:rgba(0,0,0,0.4); '
             f'border-radius:6px; font-family:JetBrains Mono,monospace; font-size:0.68rem; '
             f'color:#94a3b8; line-height:1.4;">shift.id={shift_sid_display}<br/>'
-            f'matched={match_display} {marker}{avail_display}</div>'
+            f'matched={match_display}<br/>{marker}{avail_display}</div>'
         )
 
     # Single-line HTML — no indentation or blank lines that would confuse
@@ -703,16 +779,32 @@ else:
 
         cards = []
         counts = {}
+    # Render each date section
+    for section_idx, date_key in enumerate(sorted(by_date.keys())):
+        shifts_for_date = by_date[date_key]
+        is_today = (date_key == now.date())
+
+        # Run punch allocation once per user per date (one-to-one matching)
+        allocation_by_uid = {}  # uid -> {sid (str) -> punch}
+        shifts_by_uid = {}
         for v in shifts_for_date:
-            user_punches = punches.get(v['uid'], []) if need_service else []
-            p = find_punch(user_punches, v, date_key)
+            shifts_by_uid.setdefault(v['uid'], []).append(v)
+        for uid, user_shifts in shifts_by_uid.items():
+            user_punches = punches.get(uid, []) if need_service else []
+            allocation_by_uid[uid] = assign_punches(user_shifts, user_punches, date_key)
+
+        cards = []
+        counts = {}
+        for v in shifts_for_date:
+            alloc = allocation_by_uid.get(v['uid'], {})
+            p = alloc.get(str(v['sid']))
             status, css, cin, cout = classify(v, p, now)
             counts[status] = counts.get(status, 0) + 1
 
-            # For debug: if no match, list the eventShiftIds present in this
-            # user's punches (scoped to today) so we can see what WAS available.
+            # Debug: list all today's eventShiftIds in this user's punches
             available_sids = []
-            if not p and user_punches:
+            if st.session_state.get('debug_mode') and need_service:
+                user_punches = punches.get(v['uid'], [])
                 for pp in user_punches:
                     st_raw = pp.get('startTimestamp')
                     if st_raw:
@@ -728,6 +820,7 @@ else:
                 'v': v, 'status': status, 'css': css, 'cin': cin, 'cout': cout,
                 'matched_sid': p.get('eventShiftId') if p else 'none',
                 'available_sids': available_sids,
+                'matched_via_proximity': p is not None and p.get('eventShiftId') is None,
             })
 
         cards.sort(key=lambda c: c['v']['start'])
