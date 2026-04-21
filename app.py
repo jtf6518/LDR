@@ -97,6 +97,10 @@ st.markdown("""
         0%, 100% { box-shadow: 0 4px 14px rgba(0,0,0,0.3), 0 0 0 0 rgba(16,185,129,0.3); }
         50%      { box-shadow: 0 4px 14px rgba(0,0,0,0.3), 0 0 0 6px rgba(16,185,129,0); }
     }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.4; }
+    }
 
     /* In Progress — amber, neutral (honest: we can't confirm live state) */
     .status-in-progress {
@@ -328,6 +332,116 @@ def get_service_times(_auth, uids_tuple):
     return result
 
 
+# ─── Kiosk live-state client ──────────────────────────────────────────────────
+# These endpoints were discovered from the kiosk.bloomerang.co HAR capture.
+# They are UNAUTHENTICATED (no session/token required) — they key off the
+# volunteer's email. Bloomerang gates access via an IP allowlist instead, so
+# these endpoints only respond from whitelisted client networks. Cloud host
+# providers (Streamlit Cloud, GCP, AWS) generally get 403 "Host not in
+# allowlist". From a residential IP, they return 200. On failure, we fall back
+# silently to the serviceTime-based matching and the dashboard still works.
+KIOSK_BASE = "https://kiosk.bloomerang.co"
+KIOSK_CACHE_TTL = 30          # is_signed_in changes in real time → refresh often
+KIOSK_TIMEOUT = 5             # cap per-volunteer request time
+KIOSK_WORKERS = 8             # parallel fan-out
+KIOSK_PROBE_TIMEOUT = 4       # for initial reachability check
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def kiosk_is_reachable():
+    """
+    Fast reachability probe. Returns True if the kiosk endpoint responds from
+    our network, False if we're IP-blocked. Cached 10 min to avoid hammering.
+    """
+    try:
+        r = requests.post(
+            f"{KIOSK_BASE}/api/v1/events/all/users/logged_in/currentevents",
+            json={"username": "reachability-check@example.invalid"},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "app-version": "2.1",
+                "Origin": KIOSK_BASE,
+                "Referer": f"{KIOSK_BASE}/kiosk/app/",
+            },
+            timeout=KIOSK_PROBE_TIMEOUT,
+        )
+        # 403 "Host not in allowlist" → not reachable
+        # 200 / 404 for unknown user → reachable
+        if r.status_code == 403:
+            return False
+        return True
+    except requests.RequestException:
+        return False
+
+
+def _fetch_kiosk_state(email):
+    """
+    POST a single email to the kiosk currentevents endpoint.
+    Returns a dict keyed by event_id with { is_signed_in, checkin_date,
+    event_user_account_id } — or None on failure.
+    """
+    if not email:
+        return None
+    try:
+        r = requests.post(
+            f"{KIOSK_BASE}/api/v1/events/all/users/logged_in/currentevents",
+            json={"username": email},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "app-version": "2.1",
+                "Origin": KIOSK_BASE,
+                "Referer": f"{KIOSK_BASE}/kiosk/app/",
+            },
+            timeout=KIOSK_TIMEOUT,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    result = {}
+    for entry in data:
+        eid = entry.get('event_id')
+        if eid is None:
+            continue
+        result[eid] = {
+            'is_signed_in': bool(entry.get('is_signed_in')),
+            'checkin_date': entry.get('checkin_date'),
+            'event_user_account_id': entry.get('event_user_account_id'),
+        }
+    return result
+
+
+@st.cache_data(ttl=KIOSK_CACHE_TTL, show_spinner=False)
+def get_kiosk_states(emails_tuple):
+    """
+    Parallel fetch of kiosk clock-in state for each email.
+    Cached 30s so rapid reruns don't re-poll.
+
+    Returns: {email.lower() -> {event_id -> {is_signed_in, checkin_date, eua_id}}}
+    """
+    emails = [e for e in emails_tuple if e]
+    if not emails:
+        return {}
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=KIOSK_WORKERS) as pool:
+        futures = {pool.submit(_fetch_kiosk_state, e): e for e in emails}
+        for f in as_completed(futures):
+            email = futures[f]
+            try:
+                result[email] = f.result() or {}
+            except Exception:
+                result[email] = {}
+    return result
+
+
 # ─── Processing ───────────────────────────────────────────────────────────────
 def build_roster(shifts_raw, target_dates):
     """Flatten shifts into (person, shift) records for the given date set."""
@@ -369,11 +483,19 @@ def build_roster(shifts_raw, target_dates):
                     fname = 'Unknown'
                     lname = f'(ID: {uid})'
 
+                # Capture identifiers needed to cross-reference with the kiosk
+                # endpoint: email is the login, eventUserAccountId is the stable
+                # per-(event,user) id that kiosk clock-in actions key off of.
+                email = (user.get('username') or '').strip().lower() or None
+                event_user_account_id = user.get('eventUserAccountId')
+
                 roster.append({
                     'uid': uid, 'sid': sid,
                     'fname': fname, 'lname': lname,
                     'role': r_name,
                     'start': s_start, 'end': s_end,
+                    'email': email,
+                    'eua_id': event_user_account_id,
                 })
                 uids.add(uid)
 
@@ -413,18 +535,20 @@ def assign_punches(user_shifts, user_punches, t_date):
     Per the Bloomerang API spec (serviceTime schema):
       - startTimestamp / endTimestamp are in UTC with ".000Z" suffix
       - dayDate is a local-timezone calendar date (YYYY-MM-DD)
-      - isActive=true means the record is current data. isActive=false means
-        this record was superseded by a later edit (see supersededBy).
-        Filtering to active-only is critical — otherwise we pick the stale
-        pre-edit version and misreport clock times.
+      - isActive=true means the record is current data; false = superseded
       - checkinTypeId:     1 = general check-in,     2 = shift clock-in
       - serviceTimeTypeId: 1 = realtime (clock-in),  2 = manually entered
 
     Algorithm:
-      1. Drop superseded records.
+      1. Drop superseded records AND records from other events — a volunteer
+         can have serviceTime entries for multiple events on the same day.
       2. Exact shift-id pass: punch.eventShiftId matches a scheduled shift.
-      3. Proximity fallback for the rare punch with no eventShiftId.
-      4. One-to-one assignment — each punch claims at most one shift.
+      3. Coverage pass: a single clocked-in session can cover multiple
+         consecutive shifts when cin ≤ shift_end and (cout is None OR
+         cout ≥ shift_start). This handles the common case of a volunteer
+         who signs up for back-to-back hours, clocks in once, works
+         continuously, and clocks out at the end.
+      4. Proximity fallback for the rare stray punch.
 
     Returns dict: {str(shift_id) -> punch_record}.
     """
@@ -433,46 +557,58 @@ def assign_punches(user_shifts, user_punches, t_date):
 
     iso_day = t_date.isoformat()
 
-    # Drop superseded records. isActive can be True, 1, None (missing), or
-    # explicitly False/0. Scraper treats truthy/missing as active, so we do
-    # the same — only explicit false is excluded.
+    # Drop superseded records AND records from other events. A volunteer
+    # can have serviceTime entries across many events in the same org;
+    # a record stamped with eventId=63116 must not match shifts in our
+    # event 51764, even if the time looks right.
     active_punches = []
     for p in user_punches:
         is_active = p.get('isActive')
         if is_active is False or is_active == 0:
             continue
+        # Only keep records for OUR event. eventId=None (event-less check-in)
+        # is acceptable because those can still be matched to a shift via time
+        # coverage — but a record stamped with a DIFFERENT event id is not ours.
+        p_event = p.get('eventId')
+        if p_event is not None and p_event != EVENT_ID:
+            continue
         active_punches.append(p)
 
-    # Step 1 — filter to today's candidates. Normalize each to an anchor time.
+    # Filter to today's candidates with parsed anchor times
     candidates = []
     for p in active_punches:
         start_raw = p.get('startTimestamp')
+        end_raw = p.get('endTimestamp')
 
         if start_raw:
-            anchor = _parse_bloomerang_ts(start_raw)
-            if anchor is None:
+            anchor_start = _parse_bloomerang_ts(start_raw)
+            if anchor_start is None:
                 continue
-            if anchor.date() != t_date:
+            if anchor_start.date() != t_date:
                 continue
+            anchor_end = _parse_bloomerang_ts(end_raw) if end_raw else None
         else:
-            # Manually entered record — no timestamps, just dayDate.
-            # dayDate is already in local timezone per the spec.
+            # Manually entered record — no timestamps, just dayDate
             day = p.get('dayDate', '')
             if not day.startswith(iso_day):
                 continue
-            anchor = None
+            anchor_start = None
+            anchor_end = None
 
-        candidates.append({'punch': p, 'anchor': anchor})
+        candidates.append({
+            'punch': p,
+            'start': anchor_start,
+            'end': anchor_end,
+        })
 
     if not candidates:
         return {}
 
-    # Step 2 — exact shift-id match. The API stamps each clock-in with the
-    # shift it was logged against. When present, this is authoritative.
     assigned = {}
     shifts_by_sid = {str(s['sid']): s for s in user_shifts}
-    candidates_remaining = []
 
+    # Step 2 — exact shift-id match (authoritative when present)
+    shift_id_matched = set()
     for c in candidates:
         p_sid = c['punch'].get('eventShiftId')
         if p_sid is not None and str(p_sid) in shifts_by_sid:
@@ -480,41 +616,78 @@ def assign_punches(user_shifts, user_punches, t_date):
             existing = assigned.get(key)
             if existing is None:
                 assigned[key] = c['punch']
+                shift_id_matched.add(id(c['punch']))
             else:
-                # Prefer realtime punch over manually-entered.
                 if c['punch'].get('startTimestamp') and not existing.get('startTimestamp'):
                     assigned[key] = c['punch']
-        else:
-            candidates_remaining.append(c)
+                    shift_id_matched.add(id(c['punch']))
 
-    # Step 3 — proximity fallback for punches without an eventShiftId.
-    # (Rare edge case — most real punches carry their shift id.)
+    # Step 3 — coverage pass: one session covers multiple consecutive shifts
+    # when its time range overlaps the shift's time range. A "session" is
+    # (cin, cout). For each candidate with a real time range, find every
+    # unclaimed shift whose window overlaps, and claim them.
+    #
+    # "Overlap" here is generous: cin must be within 30 min before shift_end
+    # AND cout (if present) must be within 30 min after shift_start. In plain
+    # English: the clock-in happened before or during the shift, and the
+    # clock-out (if any) happened during or after.
+    for c in candidates:
+        if c['start'] is None:
+            continue  # manually entered, no time range
+        cin = c['start']
+        cout = c['end']  # may be None if still clocked in
+
+        # How late-start are we willing to forgive? 30 min of grace.
+        latest_valid_cin = lambda s: s['end'] + timedelta(minutes=30)
+        # How early-finish are we willing to forgive? If cout is before the
+        # shift even started by more than 30 min, it didn't cover the shift.
+        earliest_valid_cout = lambda s: s['start'] - timedelta(minutes=30)
+
+        for s in user_shifts:
+            sid_key = str(s['sid'])
+            if sid_key in assigned:
+                continue  # already claimed
+
+            # Did this session cover this shift?
+            if cin > latest_valid_cin(s):
+                continue  # clocked in too late (after shift was already over + 30min)
+            if cout is not None and cout < earliest_valid_cout(s):
+                continue  # clocked out before shift began (+30min grace)
+
+            # Session covers the shift.
+            assigned[sid_key] = c['punch']
+
+    # Step 4 — proximity fallback for any still-unclaimed shifts and any
+    # remaining punches that weren't used in coverage (e.g., because they
+    # were brief or fell entirely outside any shift's window).
     unclaimed_shifts = [s for s in user_shifts if str(s['sid']) not in assigned]
+    used_punch_ids = {id(p) for p in assigned.values()}
+    remaining_candidates = [c for c in candidates if id(c['punch']) not in used_punch_ids]
 
     scored = []
-    for c in candidates_remaining:
-        if c['anchor'] is None:
+    for c in remaining_candidates:
+        if c['start'] is None:
             continue
         for s in unclaimed_shifts:
-            if c['anchor'] < s['start'] - timedelta(minutes=30):
+            if c['start'] < s['start'] - timedelta(minutes=30):
                 continue
-            if c['anchor'] > s['end'] + timedelta(minutes=60):
+            if c['start'] > s['end'] + timedelta(minutes=60):
                 continue
-            distance = abs((c['anchor'] - s['start']).total_seconds())
+            distance = abs((c['start'] - s['start']).total_seconds())
             scored.append((distance, c, s))
 
     scored.sort(key=lambda t: t[0])
 
-    used_punch_ids = set()
+    used_in_proximity = set()
     for distance, c, s in scored:
         sid_key = str(s['sid'])
         if sid_key in assigned:
             continue
         pid = id(c['punch'])
-        if pid in used_punch_ids:
+        if pid in used_in_proximity:
             continue
         assigned[sid_key] = c['punch']
-        used_punch_ids.add(pid)
+        used_in_proximity.add(pid)
 
     return assigned
 
@@ -530,13 +703,89 @@ def find_punch(user_punches, shift_info, t_date, _cache=None):
     return None  # overridden below — this function is now only called with pre-computed results
 
 
-def classify(shift_info, punch, now):
+def needs_kiosk_poll(shift_info, punch, now):
     """
-    Honest status derivation — no claims about live state we can't verify.
+    Decide whether we actually need a fresh kiosk-state fetch for this shift
+    right now. The goal is to skip unnecessary API calls for shifts whose
+    status is already settled (Completed, No Show, etc.).
+
+    Polling windows (relative to shift start/end):
+
+      CLOCK-IN TRACKING
+      • [start - 10m, start + 30m]  → watching for the clock-in to appear.
+        After +30m with no clock-in, we lock in "No Show" permanently.
+
+      CLOCK-OUT TRACKING
+      • [end - 10m, end + 30m]      → watching for the clock-out.
+        If still clocked in at end + 30m, we lock in "Missing Clock-Out".
+      • Single extra check at end + 90m → final chance to catch a late
+        clock-out before we mark "Did Not Clock Out" permanently.
+
+    Anything outside these windows returns False — status is stable.
+    """
+    start, end = shift_info['start'], shift_info['end']
+
+    # If we already have a complete punch record (cin + cout), no polling needed
+    if punch:
+        cin_raw = punch.get('startTimestamp')
+        cout_raw = punch.get('endTimestamp')
+        # Manager-fix (both null): finalized
+        if not cin_raw and not cout_raw:
+            return False
+        # Both present: finalized
+        if cin_raw and cout_raw:
+            return False
+        # cin but no cout: fall through — may still clock out
+
+    # Clock-in window: up to +30 min after start
+    if start - timedelta(minutes=10) <= now <= start + timedelta(minutes=30):
+        # If we don't have a clock-in yet, keep polling
+        has_cin = punch and punch.get('startTimestamp')
+        if not has_cin:
+            return True
+
+    # Clock-out window: end - 10m to end + 30m
+    if end - timedelta(minutes=10) <= now <= end + timedelta(minutes=30):
+        # Only care about clock-out if we don't already have one
+        if punch:
+            cout_raw = punch.get('endTimestamp')
+            if not cout_raw:
+                return True
+        else:
+            # No punch record visible yet — might be a live clock-in still in progress
+            return True
+
+    # Final clock-out check at end + 90m (±5 min window so the Streamlit
+    # refresh cadence reliably catches it)
+    if end + timedelta(minutes=85) <= now <= end + timedelta(minutes=95):
+        if punch:
+            cout_raw = punch.get('endTimestamp')
+            if not cout_raw:
+                return True
+
+    return False
+
+
+def classify(shift_info, punch, now, kiosk_state=None):
+    """
+    Determine shift status. Uses these sources in priority order:
+
+    1. Completed punch record (clock-in + clock-out) → Completed
+    2. Manager-fix record (both timestamps null) → Completed (Fixed)
+    3. Clock-in-only punch + kiosk says is_signed_in → On Shift
+    4. Clock-in-only punch + we're past end + 90m → Did Not Clock Out (final)
+    5. Clock-in-only punch + we're past end + 30m → Missing Clock-Out
+    6. Clock-in-only punch + still within shift window → On Shift
+    7. Kiosk says is_signed_in (no punch yet) → On Shift (live)
+    8. Past shift start by 30m+, no evidence → No Show (final)
+    9. Past shift start, no clock-in → Late
+    10. Future / in-window → Scheduled / Starting Soon / In Progress
+
     Returns (status_label, css_class, clock_in_dt, clock_out_dt).
     """
     start, end = shift_info['start'], shift_info['end']
 
+    # Completed or manager-fix punch records are authoritative history
     if punch:
         cin_raw = punch.get('startTimestamp')
         cout_raw = punch.get('endTimestamp')
@@ -551,32 +800,51 @@ def classify(shift_info, punch, now):
             return 'Completed', 'status-completed', cin, cout
 
         if cin and not cout:
+            # Clocked in but not out. Kiosk state wins when available.
+            if kiosk_state and kiosk_state.get('is_signed_in'):
+                return 'On Shift', 'status-checked-in', cin, None
+            # Final lock-in: 90+ min past end with no clock-out = definitely failed to clock out
+            if now > end + timedelta(minutes=90):
+                return 'Did Not Clock Out', 'status-alert-amber', cin, None
             if now > end + timedelta(minutes=LATE_OUT_MINUTES):
                 return 'Missing Clock-Out', 'status-alert-amber', cin, None
             return 'On Shift', 'status-checked-in', cin, None
 
-    # No punch record visible
+    # No punch record — but kiosk may say they're currently clocked in.
+    # Happens during a shift that's in progress before serviceTime has synced.
+    if kiosk_state and kiosk_state.get('is_signed_in'):
+        cin = _parse_bloomerang_ts(kiosk_state.get('checkin_date'))
+        if cin and start - timedelta(hours=1) <= cin <= end + timedelta(hours=1):
+            return 'On Shift', 'status-checked-in', cin, None
+
+    # No evidence of attendance
     if now < start - timedelta(minutes=UPCOMING_MINUTES):
         return 'Scheduled', 'status-pending', None, None
     if now < start:
         return 'Starting Soon', 'status-upcoming', None, None
-    if now <= end + timedelta(minutes=LATE_OUT_MINUTES):
-        # Shift window is active — serviceTime doesn't surface live clock-ins
+    # Shift has started but no clock-in visible
+    if now <= start + timedelta(minutes=10):
+        # Grace period — they may just be clocking in right now
         return 'In Progress', 'status-in-progress', None, None
-    # Shift is over and nothing was recorded
+    if now <= start + timedelta(minutes=30):
+        # Past grace but within late window
+        return 'Late', 'status-alert-amber', None, None
+    # Past late window → No Show (permanent)
     return 'No Show', 'status-alert-red', None, None
 
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
-def render_meta_bar(counts, total, sync_time=None):
+def render_meta_bar(counts, total, sync_time=None, live=False):
     done = counts.get('Completed', 0) + counts.get('Completed (Fixed)', 0)
     on = counts.get('On Shift', 0)
     inprog = counts.get('In Progress', 0)
     up = counts.get('Starting Soon', 0)
     sched = counts.get('Scheduled', 0)
+    late = counts.get('Late', 0)
     miss = counts.get('Missing Clock-Out', 0)
+    dnc = counts.get('Did Not Clock Out', 0)
     ns = counts.get('No Show', 0)
-    alerts = miss + ns
+    alerts = late + miss + dnc + ns
 
     parts = [f'<div class="stat"><b>{total}</b> shifts</div>']
     if done:   parts.append(f'<div class="stat"><span class="dot dot-purple"></span><b>{done}</b> completed</div>')
@@ -585,6 +853,10 @@ def render_meta_bar(counts, total, sync_time=None):
     if up:     parts.append(f'<div class="stat"><span class="dot dot-blue"></span><b>{up}</b> starting soon</div>')
     if sched:  parts.append(f'<div class="stat"><span class="dot dot-gray"></span><b>{sched}</b> scheduled</div>')
     if alerts: parts.append(f'<div class="stat"><span class="dot dot-red"></span><b>{alerts}</b> needs attention</div>')
+    if live:
+        parts.append('<div class="stat" style="color:#10b981;"><span class="dot dot-green" '
+                     'style="animation:pulse 1.5s ease-in-out infinite;"></span>'
+                     '<b>LIVE</b> clock-in state</div>')
     if sync_time:
         parts.append(f'<div class="stat" style="margin-left:auto; color:#64748b;">'
                      f'Last sync: {sync_time.strftime("%I:%M:%S %p")}</div>')
@@ -783,39 +1055,73 @@ else:
     else:
         punches = {uid: [] for uid in uids}
 
-    # Group roster by date
+    # Live kiosk state — only meaningful when TODAY is in the range.
+    # We ONLY poll the kiosk for volunteers who have at least one shift
+    # currently in an active "check window" (±10min of start, ±30min of end,
+    # etc. — see needs_kiosk_poll). Shifts outside those windows have stable
+    # state, so polling them is wasted API traffic.
+    today_in_range = any(d == now.date() for d in dates_in_range)
+    kiosk_states_by_email = {}
+    kiosk_available = False
+
+    if today_in_range:
+        kiosk_available = kiosk_is_reachable()
+
+    # Group roster by date first — we need allocations before deciding who to poll
     by_date = {}
     for v in roster:
         d_key = v['start'].date()
         by_date.setdefault(d_key, []).append(v)
 
-    # Render each date section
-    for section_idx, date_key in enumerate(sorted(by_date.keys())):
-        shifts_for_date = by_date[date_key]
-        is_today = (date_key == now.date())
-
-        cards = []
-        counts = {}
-    # Render each date section
-    for section_idx, date_key in enumerate(sorted(by_date.keys())):
-        shifts_for_date = by_date[date_key]
-        is_today = (date_key == now.date())
-
-        # Run punch allocation once per user per date (one-to-one matching)
-        allocation_by_uid = {}  # uid -> {sid (str) -> punch}
+    # Build today's allocations now (rather than per-section in the render loop)
+    # so we can make the "who needs polling" decision with full information.
+    allocations_by_date = {}
+    for date_key, shifts_for_date in by_date.items():
         shifts_by_uid = {}
         for v in shifts_for_date:
             shifts_by_uid.setdefault(v['uid'], []).append(v)
+        allocations_by_date[date_key] = {}
         for uid, user_shifts in shifts_by_uid.items():
             user_punches = punches.get(uid, []) if need_service else []
-            allocation_by_uid[uid] = assign_punches(user_shifts, user_punches, date_key)
+            allocations_by_date[date_key][uid] = assign_punches(
+                user_shifts, user_punches, date_key)
+
+    # Figure out which emails need a live kiosk fetch right now
+    if today_in_range and kiosk_available:
+        today_shifts = by_date.get(now.date(), [])
+        emails_to_poll = set()
+        for v in today_shifts:
+            if not v.get('email'):
+                continue
+            alloc = allocations_by_date[now.date()].get(v['uid'], {})
+            punch_for_shift = alloc.get(str(v['sid']))
+            if needs_kiosk_poll(v, punch_for_shift, now):
+                emails_to_poll.add(v['email'])
+
+        if emails_to_poll:
+            with st.spinner("Checking live clock-in state..."):
+                kiosk_states_by_email = get_kiosk_states(
+                    tuple(sorted(emails_to_poll)))
+
+    # Render each date section
+    for section_idx, date_key in enumerate(sorted(by_date.keys())):
+        shifts_for_date = by_date[date_key]
+        is_today = (date_key == now.date())
+        allocation_by_uid = allocations_by_date[date_key]
 
         cards = []
         counts = {}
         for v in shifts_for_date:
             alloc = allocation_by_uid.get(v['uid'], {})
             p = alloc.get(str(v['sid']))
-            status, css, cin, cout = classify(v, p, now)
+
+            # Pull kiosk state for this volunteer/event if available
+            kiosk_state = None
+            if is_today and kiosk_available and v.get('email'):
+                per_event = kiosk_states_by_email.get(v['email'], {})
+                kiosk_state = per_event.get(EVENT_ID)
+
+            status, css, cin, cout = classify(v, p, now, kiosk_state)
             counts[status] = counts.get(status, 0) + 1
 
             # Debug: list all today's eventShiftIds in this user's punches
@@ -834,6 +1140,7 @@ else:
                 'matched_sid': p.get('eventShiftId') if p else 'none',
                 'available_sids': available_sids,
                 'matched_via_proximity': p is not None and p.get('eventShiftId') is None,
+                'kiosk_state': kiosk_state,
             })
 
         cards.sort(key=lambda c: c['v']['start'])
@@ -845,9 +1152,13 @@ else:
             f'{today_badge}</div>',
             unsafe_allow_html=True
         )
-        # Show sync time only on the first section to avoid clutter
-        render_meta_bar(counts, len(cards),
-                        sync_time=now if section_idx == 0 else None)
+        # Show sync time only on the first section to avoid clutter.
+        # Live indicator shows on today's section when kiosk endpoint is up.
+        render_meta_bar(
+            counts, len(cards),
+            sync_time=now if section_idx == 0 else None,
+            live=(is_today and kiosk_available),
+        )
 
         # Card grid
         cols = st.columns(4)
