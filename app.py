@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import time
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -339,12 +339,9 @@ def build_roster(shifts_raw, target_dates):
     seen = set()
 
     for shift in shifts_raw:
-        try:
-            s_start = datetime.fromisoformat(
-                shift['startDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            s_end = datetime.fromisoformat(
-                shift['endDate'].replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-        except Exception:
+        s_start = _parse_bloomerang_ts(shift.get('startDate'))
+        s_end = _parse_bloomerang_ts(shift.get('endDate'))
+        if s_start is None or s_end is None:
             continue
 
         if s_start.date() not in target_dates:
@@ -383,54 +380,86 @@ def build_roster(shifts_raw, target_dates):
     return roster, list(uids)
 
 
+def _parse_bloomerang_ts(raw):
+    """
+    Parse a Bloomerang timestamp string. Bloomerang's API returns timestamps
+    either as `2026-04-11T18:01:23.000Z` (explicit UTC) or as bare
+    `2026-04-11T18:01:23` (implicit UTC, no suffix). Python's fromisoformat
+    with a naive string returns a naive datetime, which .astimezone() then
+    misinterprets using the server's local zone. We normalize by:
+      1. Stripping Z and attaching explicit UTC
+      2. If still naive after parsing, attaching UTC anyway
+      3. Converting to LOCAL_TZ
+
+    Returns a timezone-aware datetime in LOCAL_TZ, or None on failure.
+    """
+    if not raw:
+        return None
+    try:
+        s = raw.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ)
+    except Exception:
+        return None
+
+
 def assign_punches(user_shifts, user_punches, t_date):
     """
     Given one volunteer's shifts and punches for a single date, decide which
     punch (if any) belongs to which shift.
 
-    Bloomerang's serviceTime endpoint, on volunteer-level tokens, mostly
-    returns records with eventShiftId=null — even when the volunteer was
-    scheduled for a specific shift. So we can't rely on the shift-id link.
+    Per the Bloomerang API spec (serviceTime schema):
+      - startTimestamp / endTimestamp are in UTC with ".000Z" suffix
+      - dayDate is a local-timezone calendar date (YYYY-MM-DD)
+      - isActive=true means the record is current data. isActive=false means
+        this record was superseded by a later edit (see supersededBy).
+        Filtering to active-only is critical — otherwise we pick the stale
+        pre-edit version and misreport clock times.
+      - checkinTypeId:     1 = general check-in,     2 = shift clock-in
+      - serviceTimeTypeId: 1 = realtime (clock-in),  2 = manually entered
 
     Algorithm:
-      1. Build today's candidate punches (real or manager-fix).
-      2. For each punch, compute the shift whose window it most plausibly
-         belongs to — the one whose start time is closest to the punch's
-         start time (or dayDate for manager-fixes).
-      3. Assign one-to-one: each punch → at most one shift, each shift → at
-         most one punch. When multiple punches target the same shift, keep
-         whichever is the tightest match.
+      1. Drop superseded records.
+      2. Exact shift-id pass: punch.eventShiftId matches a scheduled shift.
+      3. Proximity fallback for the rare punch with no eventShiftId.
+      4. One-to-one assignment — each punch claims at most one shift.
 
-    Returns dict: {shift_id -> punch_record}.
+    Returns dict: {str(shift_id) -> punch_record}.
     """
     if not user_punches or not user_shifts:
         return {}
 
     iso_day = t_date.isoformat()
 
-    # Step 1 — filter to today's candidates. Normalize each to a "punch anchor
-    # time" we can use for proximity comparison.
-    candidates = []
+    # Drop superseded records. isActive can be True, 1, None (missing), or
+    # explicitly False/0. Scraper treats truthy/missing as active, so we do
+    # the same — only explicit false is excluded.
+    active_punches = []
     for p in user_punches:
+        is_active = p.get('isActive')
+        if is_active is False or is_active == 0:
+            continue
+        active_punches.append(p)
+
+    # Step 1 — filter to today's candidates. Normalize each to an anchor time.
+    candidates = []
+    for p in active_punches:
         start_raw = p.get('startTimestamp')
-        end_raw = p.get('endTimestamp')
 
         if start_raw:
-            try:
-                anchor = datetime.fromisoformat(
-                    start_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-            except Exception:
+            anchor = _parse_bloomerang_ts(start_raw)
+            if anchor is None:
                 continue
             if anchor.date() != t_date:
                 continue
         else:
-            # Manager-fix: no timestamps, just dayDate
+            # Manually entered record — no timestamps, just dayDate.
+            # dayDate is already in local timezone per the spec.
             day = p.get('dayDate', '')
             if not day.startswith(iso_day):
                 continue
-            # For fix entries we can't anchor by time, so fall back to the
-            # punch's stamped eventShiftId (if any) — manager fixes usually
-            # do carry it.
             anchor = None
 
         candidates.append({'punch': p, 'anchor': anchor})
@@ -438,45 +467,35 @@ def assign_punches(user_shifts, user_punches, t_date):
     if not candidates:
         return {}
 
-    # Step 2 — exact-shift-id pass. Any punch whose eventShiftId matches a
-    # shift id on the roster is locked to that shift; remove both from the
-    # unassigned pools.
+    # Step 2 — exact shift-id match. The API stamps each clock-in with the
+    # shift it was logged against. When present, this is authoritative.
     assigned = {}
-    shifts_remaining = {str(s['sid']): s for s in user_shifts}
+    shifts_by_sid = {str(s['sid']): s for s in user_shifts}
     candidates_remaining = []
 
     for c in candidates:
         p_sid = c['punch'].get('eventShiftId')
-        if p_sid is not None and str(p_sid) in shifts_remaining:
+        if p_sid is not None and str(p_sid) in shifts_by_sid:
             key = str(p_sid)
-            # If multiple punches claim the same shift id, keep the one with
-            # a real clock-in time over a manager-fix.
             existing = assigned.get(key)
             if existing is None:
                 assigned[key] = c['punch']
             else:
-                # Prefer real-punch over fix; otherwise keep the newer.
+                # Prefer realtime punch over manually-entered.
                 if c['punch'].get('startTimestamp') and not existing.get('startTimestamp'):
                     assigned[key] = c['punch']
         else:
             candidates_remaining.append(c)
 
-    # Step 3 — proximity pass for unstamped punches.
-    # Build list of (shift_id, shift_start, shift_end) still unclaimed.
-    # For each remaining punch with an anchor time, score every shift window
-    # by the absolute distance from anchor to shift_start, then do a greedy
-    # assignment (closest first, one punch per shift).
+    # Step 3 — proximity fallback for punches without an eventShiftId.
+    # (Rare edge case — most real punches carry their shift id.)
     unclaimed_shifts = [s for s in user_shifts if str(s['sid']) not in assigned]
 
     scored = []
     for c in candidates_remaining:
         if c['anchor'] is None:
-            # Manager-fix without eventShiftId and no time anchor —
-            # impossible to assign objectively. Skip.
             continue
         for s in unclaimed_shifts:
-            # Only consider punches that actually land near the shift:
-            # anywhere from 30 min before start to 60 min after end.
             if c['anchor'] < s['start'] - timedelta(minutes=30):
                 continue
             if c['anchor'] > s['end'] + timedelta(minutes=60):
@@ -486,16 +505,16 @@ def assign_punches(user_shifts, user_punches, t_date):
 
     scored.sort(key=lambda t: t[0])
 
-    used_punches = set()
+    used_punch_ids = set()
     for distance, c, s in scored:
         sid_key = str(s['sid'])
         if sid_key in assigned:
-            continue  # this shift already claimed
+            continue
         pid = id(c['punch'])
-        if pid in used_punches:
-            continue  # this punch already claimed
+        if pid in used_punch_ids:
+            continue
         assigned[sid_key] = c['punch']
-        used_punches.add(pid)
+        used_punch_ids.add(pid)
 
     return assigned
 
@@ -521,10 +540,8 @@ def classify(shift_info, punch, now):
     if punch:
         cin_raw = punch.get('startTimestamp')
         cout_raw = punch.get('endTimestamp')
-        cin = (datetime.fromisoformat(cin_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-               if cin_raw else None)
-        cout = (datetime.fromisoformat(cout_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                if cout_raw else None)
+        cin = _parse_bloomerang_ts(cin_raw)
+        cout = _parse_bloomerang_ts(cout_raw)
 
         # Manager-fix entry — hours credited manually
         if not cin and not cout:
@@ -808,13 +825,9 @@ else:
                 for pp in user_punches:
                     st_raw = pp.get('startTimestamp')
                     if st_raw:
-                        try:
-                            dt = datetime.fromisoformat(
-                                st_raw.replace('Z', '+00:00')).astimezone(LOCAL_TZ)
-                            if dt.date() == date_key:
-                                available_sids.append(pp.get('eventShiftId'))
-                        except Exception:
-                            pass
+                        dt = _parse_bloomerang_ts(st_raw)
+                        if dt and dt.date() == date_key:
+                            available_sids.append(pp.get('eventShiftId'))
 
             cards.append({
                 'v': v, 'status': status, 'css': css, 'cin': cin, 'cout': cout,
