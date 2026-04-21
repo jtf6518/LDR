@@ -347,31 +347,55 @@ KIOSK_WORKERS = 8             # parallel fan-out
 KIOSK_PROBE_TIMEOUT = 4       # for initial reachability check
 
 
+# Browser-like headers for the kiosk endpoints — Bloomerang's API seems to
+# reject requests that don't look browser-ish (plain python-requests UA gets
+# funky responses). These match what the kiosk SPA sends.
+KIOSK_HEADERS = {
+    "Content-Type": "application/json;charset=UTF-8",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "app-version": "2.1",
+    "Origin": KIOSK_BASE,
+    "Referer": f"{KIOSK_BASE}/kiosk/app/",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    ),
+}
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def kiosk_probe_status():
+def kiosk_probe_status(probe_email):
     """
     Probe the kiosk endpoint and return a structured status so the UI can
-    explain exactly what's happening. Cached 10 min.
+    explain exactly what's happening. Cached 10 min per email.
+
+    probe_email: a real Bloomerang volunteer email to test with. Using a
+      real email guarantees the server won't choke on a fake address and
+      return 401 "Invalid Request Parameters" — which was masking genuine
+      reachability.
 
     Returns a dict:
       {
-        'reachable': bool,
+        'reachable': bool,         # can we actually use this endpoint
         'status_code': int or None,
-        'reason': str (human-readable),
-        'detail': str (short detail for sidebar / tooltip)
+        'reason': str,             # short human label
+        'detail': str,             # longer detail for sidebar/tooltip
       }
     """
+    if not probe_email:
+        return {
+            'reachable': False,
+            'status_code': None,
+            'reason': 'No probe email',
+            'detail': 'Need a real volunteer email to probe with.',
+        }
+
     try:
         r = requests.post(
             f"{KIOSK_BASE}/api/v1/events/all/users/logged_in/currentevents",
-            json={"username": "reachability-check@example.invalid"},
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "app-version": "2.1",
-                "Origin": KIOSK_BASE,
-                "Referer": f"{KIOSK_BASE}/kiosk/app/",
-            },
+            json={"username": probe_email},
+            headers=KIOSK_HEADERS,
             timeout=KIOSK_PROBE_TIMEOUT,
         )
     except requests.Timeout:
@@ -397,15 +421,8 @@ def kiosk_probe_status():
         }
 
     sc = r.status_code
-    body = (r.text or '')[:200]
+    body = (r.text or '')[:300]
 
-    if sc == 403:
-        return {
-            'reachable': False,
-            'status_code': 403,
-            'reason': 'IP blocked by Bloomerang',
-            'detail': body or 'Host not in allowlist — run from a whitelisted network.',
-        }
     if sc == 200:
         return {
             'reachable': True,
@@ -413,7 +430,32 @@ def kiosk_probe_status():
             'reason': 'Reachable',
             'detail': 'Kiosk endpoint responding normally.',
         }
-    # Other status (404, 500, etc.) — endpoint is reachable but something else is wrong
+
+    # 403 specifically with "allowlist" body = definitive IP block
+    if sc == 403 and 'allowlist' in body.lower():
+        return {
+            'reachable': False,
+            'status_code': 403,
+            'reason': 'IP blocked',
+            'detail': 'Host not in allowlist — run from a whitelisted network.',
+        }
+
+    # Any other HTTP response means the server HEARD us — we're past the
+    # network/firewall gate. The request may be malformed or the user
+    # unknown, but the endpoint is accessible.
+    if sc in (400, 401, 404, 422):
+        return {
+            'reachable': True,
+            'status_code': sc,
+            'reason': f'Reachable (HTTP {sc} on probe)',
+            'detail': (
+                f'Server processed our request but returned HTTP {sc}. '
+                f'Real fetches for valid volunteers should still succeed. '
+                f'Body: {body}'
+            ),
+        }
+
+    # Unexpected — 5xx or a 403 without the expected body
     return {
         'reachable': False,
         'status_code': sc,
@@ -422,9 +464,9 @@ def kiosk_probe_status():
     }
 
 
-def kiosk_is_reachable():
+def kiosk_is_reachable(probe_email):
     """Boolean convenience wrapper around kiosk_probe_status."""
-    return kiosk_probe_status()['reachable']
+    return kiosk_probe_status(probe_email)['reachable']
 
 
 def _fetch_kiosk_state(email):
@@ -439,13 +481,7 @@ def _fetch_kiosk_state(email):
         r = requests.post(
             f"{KIOSK_BASE}/api/v1/events/all/users/logged_in/currentevents",
             json={"username": email},
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "app-version": "2.1",
-                "Origin": KIOSK_BASE,
-                "Referer": f"{KIOSK_BASE}/kiosk/app/",
-            },
+            headers=KIOSK_HEADERS,
             timeout=KIOSK_TIMEOUT,
         )
         if r.status_code != 200:
@@ -1073,18 +1109,22 @@ with st.sidebar:
         st.caption(f"Auto-refreshes every {REFRESH_SECS}s")
 
         # Live kiosk diagnostic — always shown so there's no guessing whether
-        # live state is active. Cached probe, so no extra API cost.
+        # live state is active. Cached probe (10min), so no extra API cost.
+        # Uses the logged-in user's own email as a probe so the server gets
+        # a valid username and we can distinguish "IP blocked" from "server
+        # rejecting invalid input."
         st.divider()
         st.caption("**Live Kiosk Status**")
-        _probe = kiosk_probe_status()
+        _probe_email = (st.session_state.get('credentials') or {}).get('email')
+        _probe = kiosk_probe_status(_probe_email)
         if _probe['reachable']:
             st.success(f"✅ {_probe['reason']}")
-            st.caption(f"HTTP {_probe['status_code']} · {_probe['detail']}")
+            st.caption(f"HTTP {_probe['status_code']} · {_probe['detail'][:200]}")
         else:
             st.warning(f"⚠️ {_probe['reason']}")
             sc = _probe.get('status_code')
             sc_str = f"HTTP {sc}" if sc else "no response"
-            st.caption(f"{sc_str} · {(_probe.get('detail') or '')[:180]}")
+            st.caption(f"{sc_str} · {(_probe.get('detail') or '')[:200]}")
             if sc == 403:
                 st.caption(
                     "The kiosk endpoint only accepts requests from allowlisted "
@@ -1164,7 +1204,8 @@ else:
     kiosk_available = False
 
     if today_in_range:
-        kiosk_status = kiosk_probe_status()
+        _probe_email = (st.session_state.get('credentials') or {}).get('email')
+        kiosk_status = kiosk_probe_status(_probe_email)
         kiosk_available = kiosk_status['reachable']
 
     # Group roster by date first — we need allocations before deciding who to poll
