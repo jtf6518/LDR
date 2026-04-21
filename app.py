@@ -348,10 +348,18 @@ KIOSK_PROBE_TIMEOUT = 4       # for initial reachability check
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def kiosk_is_reachable():
+def kiosk_probe_status():
     """
-    Fast reachability probe. Returns True if the kiosk endpoint responds from
-    our network, False if we're IP-blocked. Cached 10 min to avoid hammering.
+    Probe the kiosk endpoint and return a structured status so the UI can
+    explain exactly what's happening. Cached 10 min.
+
+    Returns a dict:
+      {
+        'reachable': bool,
+        'status_code': int or None,
+        'reason': str (human-readable),
+        'detail': str (short detail for sidebar / tooltip)
+      }
     """
     try:
         r = requests.post(
@@ -366,13 +374,57 @@ def kiosk_is_reachable():
             },
             timeout=KIOSK_PROBE_TIMEOUT,
         )
-        # 403 "Host not in allowlist" → not reachable
-        # 200 / 404 for unknown user → reachable
-        if r.status_code == 403:
-            return False
-        return True
-    except requests.RequestException:
-        return False
+    except requests.Timeout:
+        return {
+            'reachable': False,
+            'status_code': None,
+            'reason': 'Timed out',
+            'detail': f'No response within {KIOSK_PROBE_TIMEOUT}s',
+        }
+    except requests.ConnectionError as e:
+        return {
+            'reachable': False,
+            'status_code': None,
+            'reason': 'Connection failed',
+            'detail': str(e)[:200],
+        }
+    except requests.RequestException as e:
+        return {
+            'reachable': False,
+            'status_code': None,
+            'reason': 'Request error',
+            'detail': str(e)[:200],
+        }
+
+    sc = r.status_code
+    body = (r.text or '')[:200]
+
+    if sc == 403:
+        return {
+            'reachable': False,
+            'status_code': 403,
+            'reason': 'IP blocked by Bloomerang',
+            'detail': body or 'Host not in allowlist — run from a whitelisted network.',
+        }
+    if sc == 200:
+        return {
+            'reachable': True,
+            'status_code': 200,
+            'reason': 'Reachable',
+            'detail': 'Kiosk endpoint responding normally.',
+        }
+    # Other status (404, 500, etc.) — endpoint is reachable but something else is wrong
+    return {
+        'reachable': False,
+        'status_code': sc,
+        'reason': f'Unexpected HTTP {sc}',
+        'detail': body,
+    }
+
+
+def kiosk_is_reachable():
+    """Boolean convenience wrapper around kiosk_probe_status."""
+    return kiosk_probe_status()['reachable']
 
 
 def _fetch_kiosk_state(email):
@@ -834,7 +886,13 @@ def classify(shift_info, punch, now, kiosk_state=None):
 
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
-def render_meta_bar(counts, total, sync_time=None, live=False):
+def render_meta_bar(counts, total, sync_time=None, kiosk_status=None, show_kiosk=False):
+    """
+    Render the status bar above the card grid.
+
+    kiosk_status: dict from kiosk_probe_status() — tells us reachable/not and why
+    show_kiosk: whether to display the kiosk status chip (only for today's section)
+    """
     done = counts.get('Completed', 0) + counts.get('Completed (Fixed)', 0)
     on = counts.get('On Shift', 0)
     inprog = counts.get('In Progress', 0)
@@ -853,10 +911,29 @@ def render_meta_bar(counts, total, sync_time=None, live=False):
     if up:     parts.append(f'<div class="stat"><span class="dot dot-blue"></span><b>{up}</b> starting soon</div>')
     if sched:  parts.append(f'<div class="stat"><span class="dot dot-gray"></span><b>{sched}</b> scheduled</div>')
     if alerts: parts.append(f'<div class="stat"><span class="dot dot-red"></span><b>{alerts}</b> needs attention</div>')
-    if live:
-        parts.append('<div class="stat" style="color:#10b981;"><span class="dot dot-green" '
-                     'style="animation:pulse 1.5s ease-in-out infinite;"></span>'
-                     '<b>LIVE</b> clock-in state</div>')
+
+    # Kiosk status chip — explicit, always shown for today regardless of whether
+    # it's reachable. No guessing.
+    if show_kiosk and kiosk_status is not None:
+        if kiosk_status.get('reachable'):
+            parts.append(
+                '<div class="stat" style="color:#10b981;" '
+                f'title="{kiosk_status.get("detail","")}">'
+                '<span class="dot dot-green" '
+                'style="animation:pulse 1.5s ease-in-out infinite;"></span>'
+                '<b>LIVE</b> clock-in state</div>'
+            )
+        else:
+            sc = kiosk_status.get('status_code')
+            reason = kiosk_status.get('reason', 'Unavailable')
+            detail = (kiosk_status.get('detail') or '').replace('"', "'")
+            sc_str = f" ({sc})" if sc else ""
+            parts.append(
+                f'<div class="stat" style="color:#f59e0b;" title="{detail}">'
+                f'<span class="dot dot-amber"></span>'
+                f'<b>Kiosk:</b>&nbsp;{reason}{sc_str}</div>'
+            )
+
     if sync_time:
         parts.append(f'<div class="stat" style="margin-left:auto; color:#64748b;">'
                      f'Last sync: {sync_time.strftime("%I:%M:%S %p")}</div>')
@@ -995,6 +1072,27 @@ with st.sidebar:
         )
         st.caption(f"Auto-refreshes every {REFRESH_SECS}s")
 
+        # Live kiosk diagnostic — always shown so there's no guessing whether
+        # live state is active. Cached probe, so no extra API cost.
+        st.divider()
+        st.caption("**Live Kiosk Status**")
+        _probe = kiosk_probe_status()
+        if _probe['reachable']:
+            st.success(f"✅ {_probe['reason']}")
+            st.caption(f"HTTP {_probe['status_code']} · {_probe['detail']}")
+        else:
+            st.warning(f"⚠️ {_probe['reason']}")
+            sc = _probe.get('status_code')
+            sc_str = f"HTTP {sc}" if sc else "no response"
+            st.caption(f"{sc_str} · {(_probe.get('detail') or '')[:180]}")
+            if sc == 403:
+                st.caption(
+                    "The kiosk endpoint only accepts requests from allowlisted "
+                    "networks. Running this app from Streamlit Cloud (GCP) is "
+                    "blocked. Run it locally (`streamlit run app.py`) from your "
+                    "home network to enable live state."
+                )
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if not st.session_state.auth_data:
     st.info("Staff Login Required.")
@@ -1062,10 +1160,12 @@ else:
     # state, so polling them is wasted API traffic.
     today_in_range = any(d == now.date() for d in dates_in_range)
     kiosk_states_by_email = {}
+    kiosk_status = None       # structured probe result for UI display
     kiosk_available = False
 
     if today_in_range:
-        kiosk_available = kiosk_is_reachable()
+        kiosk_status = kiosk_probe_status()
+        kiosk_available = kiosk_status['reachable']
 
     # Group roster by date first — we need allocations before deciding who to poll
     by_date = {}
@@ -1153,11 +1253,13 @@ else:
             unsafe_allow_html=True
         )
         # Show sync time only on the first section to avoid clutter.
-        # Live indicator shows on today's section when kiosk endpoint is up.
+        # Kiosk status chip shows on today's section — green "LIVE" when up,
+        # amber "Kiosk: <reason>" when blocked, so it's never ambiguous.
         render_meta_bar(
             counts, len(cards),
             sync_time=now if section_idx == 0 else None,
-            live=(is_today and kiosk_available),
+            kiosk_status=kiosk_status,
+            show_kiosk=is_today,
         )
 
         # Card grid
