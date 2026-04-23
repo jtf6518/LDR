@@ -2,6 +2,8 @@ import streamlit as st
 import requests
 import time
 import os
+import logging
+import collections
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +36,91 @@ UPCOMING_MINUTES = 60     # within this many min of start → "Starting Soon"
 LATE_OUT_MINUTES = 30     # clocked in but not out this long after shift end → "Missing Clock-Out"
 
 st.set_page_config(page_title="Refuge Live Board", page_icon="🐾", layout="wide")
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+# Two outputs:
+#   1. Python `logging` to stdout — shows up in Streamlit Cloud's Logs panel
+#      and any terminal where `streamlit run` is active.
+#   2. In-memory ring buffer — last N log records, rendered as an expandable
+#      "Debug Log" panel at the bottom of the dashboard. Also downloadable
+#      as a single text file.
+#
+# The ring buffer lives on the Streamlit session-state dict so it survives
+# reruns (Streamlit reruns the script top-to-bottom on every interaction).
+# We pick a practical cap (~1000 lines) so memory stays bounded even across
+# a long-running session.
+
+LOG_BUFFER_SIZE = 1000
+LOG_LEVEL = logging.DEBUG  # verbose by default; dial down later if noisy
+
+
+class _RingBufferHandler(logging.Handler):
+    """A logging handler that pushes formatted records into a deque.
+    The deque is shared across the whole session (stored on st.session_state)
+    so the Debug Log panel always reflects the most recent activity."""
+
+    def __init__(self, buffer):
+        super().__init__()
+        self.buffer = buffer
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.buffer.append(msg)
+        except Exception:
+            # Never let logging crash the app
+            self.handleError(record)
+
+
+def _init_logging():
+    """
+    Idempotent logger setup. Safe to call on every Streamlit rerun — only
+    adds handlers once. Attaches both a stdout handler and the in-memory
+    ring-buffer handler.
+    """
+    if 'log_buffer' not in st.session_state:
+        st.session_state['log_buffer'] = collections.deque(maxlen=LOG_BUFFER_SIZE)
+
+    root = logging.getLogger('refugeboard')
+    if getattr(root, '_refuge_configured', False):
+        # Re-wire the ring buffer handler in case session_state deque got
+        # replaced (shouldn't happen, but cheap defense).
+        for h in root.handlers:
+            if isinstance(h, _RingBufferHandler):
+                h.buffer = st.session_state['log_buffer']
+        return root
+
+    root.setLevel(LOG_LEVEL)
+    root.propagate = False  # don't double-log through Streamlit's root logger
+
+    fmt = logging.Formatter(
+        '%(asctime)s.%(msecs)03d %(levelname)-5s %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    stdout_h = logging.StreamHandler()
+    stdout_h.setFormatter(fmt)
+    stdout_h.setLevel(LOG_LEVEL)
+    root.addHandler(stdout_h)
+
+    ring_h = _RingBufferHandler(st.session_state['log_buffer'])
+    ring_h.setFormatter(fmt)
+    ring_h.setLevel(LOG_LEVEL)
+    root.addHandler(ring_h)
+
+    root._refuge_configured = True
+    return root
+
+
+# Shorthand loggers for each subsystem. Makes log filtering easy (grep by name).
+_init_logging()
+log_auth    = logging.getLogger('refugeboard.auth')
+log_api     = logging.getLogger('refugeboard.api')
+log_kiosk   = logging.getLogger('refugeboard.kiosk')
+log_match   = logging.getLogger('refugeboard.match')
+log_render  = logging.getLogger('refugeboard.render')
+log_cache   = logging.getLogger('refugeboard.cache')
+
 
 # ─── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -185,6 +272,8 @@ st.markdown("""
 # ─── Auth ─────────────────────────────────────────────────────────────────────
 def authenticate_headless(email, password):
     """Headless Chrome login. Returns auth dict or None."""
+    log_auth.info("authenticate_headless start for email=%s", email)
+    t0 = time.time()
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -239,8 +328,14 @@ def authenticate_headless(email, password):
             return null;
         """)
 
+        log_auth.info(
+            "authenticate_headless OK: got %d cookies, token %s in %.0fms",
+            len(sess.cookies), 'present' if token else 'MISSING',
+            (time.time() - t0) * 1000,
+        )
         return {"sess": sess, "token": token}
     except Exception as e:
+        log_auth.error("authenticate_headless FAILED: %s", str(e)[:300])
         st.error(f"Login failed: {e}")
         return None
     finally:
@@ -254,6 +349,7 @@ def attempt_silent_reauth():
     gets a 401. Mutates st.session_state.auth_data in place so all in-flight
     references pick up the new cookies/token.
     """
+    log_auth.warning("attempt_silent_reauth triggered")
     creds = st.session_state.get('credentials')
     if not creds:
         return None
@@ -307,18 +403,30 @@ def safe_get_json(auth, url, params=None, _retried=False):
 @st.cache_data(ttl=SHIFT_CACHE_TTL)
 def get_shifts(_auth):
     """All shifts for the event. Returns raw list or error string. Cached 5 min."""
-    return safe_get_json(_auth,
+    log_api.info("GET shifts (cache miss — fetching from Bloomerang)")
+    t0 = time.time()
+    result = safe_get_json(_auth,
         f"{BASE}/api/v4/organizations/{ORG_ID}/events/{EVENT_ID}/shifts",
         {"includeShiftRoles": "true",
          "includeShiftUsers": "true",
          "take": 500,
          "includePast": "true"})
+    if isinstance(result, list):
+        log_api.info("GET shifts OK: %d shifts in %.0fms",
+                     len(result), (time.time() - t0) * 1000)
+    else:
+        log_api.error("GET shifts FAILED: %s", str(result)[:200])
+    return result
 
 
 @st.cache_data(ttl=SERVICE_CACHE_TTL)
 def get_service_times(_auth, uids_tuple):
     """Parallel fetch of serviceTime for each uid. Cached 60 sec."""
     uids = list(uids_tuple)
+    log_api.info(
+        "GET serviceTime batch (cache miss): %d uid(s)", len(uids)
+    )
+    t0 = time.time()
     result = {}
     def fetch(uid):
         r = safe_get_json(_auth,
@@ -329,6 +437,11 @@ def get_service_times(_auth, uids_tuple):
         for f in as_completed(futures):
             uid, data = f.result()
             result[uid] = data
+    total_records = sum(len(v) for v in result.values())
+    log_api.info(
+        "GET serviceTime batch done: %d records across %d uid(s) in %.0fms",
+        total_records, len(uids), (time.time() - t0) * 1000,
+    )
     return result
 
 
@@ -396,8 +509,11 @@ def _kiosk_session_fetch(email, timeout=KIOSK_TIMEOUT):
     }
     if not email:
         result['error'] = 'no email provided'
+        log_kiosk.warning("session_fetch called with no email — skipping")
         return result
 
+    log_kiosk.debug("session_fetch start email=%s timeout=%s", email, timeout)
+    t0 = time.time()
     sess = requests.Session()
     sess.headers.update(KIOSK_HEADERS)
 
@@ -410,12 +526,21 @@ def _kiosk_session_fetch(email, timeout=KIOSK_TIMEOUT):
         )
         result['login_status'] = r1.status_code
         result['login_body'] = (r1.text or '')[:400]
+        log_kiosk.debug(
+            "step1 login email=%s status=%s len=%d (%.0fms)",
+            email, r1.status_code, len(r1.text or ''),
+            (time.time() - t0) * 1000,
+        )
 
         if r1.status_code != 200:
-            # Login failed — don't bother with step 2
+            log_kiosk.warning(
+                "step1 login FAILED email=%s status=%s body=%s",
+                email, r1.status_code, result['login_body'][:160]
+            )
             return result
 
         # Step 2 — currentevents, now with session cookies from step 1
+        t1 = time.time()
         r2 = sess.post(
             f"{KIOSK_BASE}/api/v1/events/all/users/logged_in/currentevents",
             json={"username": email},
@@ -423,21 +548,56 @@ def _kiosk_session_fetch(email, timeout=KIOSK_TIMEOUT):
         )
         result['events_status'] = r2.status_code
         result['events_body'] = (r2.text or '')[:400]
+        log_kiosk.debug(
+            "step2 currentevents email=%s status=%s len=%d (%.0fms)",
+            email, r2.status_code, len(r2.text or ''),
+            (time.time() - t1) * 1000,
+        )
 
         if r2.status_code == 200:
             try:
                 parsed = r2.json()
                 if isinstance(parsed, list):
                     result['events_data'] = parsed
+                    # Summarize what we got per-event
+                    for entry in parsed:
+                        log_kiosk.info(
+                            "state email=%s event_id=%s is_signed_in=%s checkin_date=%s",
+                            email,
+                            entry.get('event_id'),
+                            entry.get('is_signed_in'),
+                            entry.get('checkin_date'),
+                        )
+                else:
+                    log_kiosk.warning(
+                        "step2 email=%s returned non-list JSON: %s",
+                        email, str(parsed)[:160]
+                    )
             except ValueError:
                 result['error'] = 'events response was not JSON'
+                log_kiosk.error(
+                    "step2 email=%s returned non-JSON body=%s",
+                    email, result['events_body'][:160]
+                )
+        else:
+            log_kiosk.warning(
+                "step2 currentevents FAILED email=%s status=%s body=%s",
+                email, r2.status_code, result['events_body'][:160]
+            )
     except requests.Timeout:
         result['error'] = f'timed out after {timeout}s'
+        log_kiosk.error("TIMEOUT email=%s after %ss", email, timeout)
     except requests.ConnectionError as e:
         result['error'] = f'connection failed: {str(e)[:150]}'
+        log_kiosk.error("CONN ERROR email=%s: %s", email, str(e)[:200])
     except requests.RequestException as e:
         result['error'] = f'request error: {str(e)[:150]}'
+        log_kiosk.error("REQ ERROR email=%s: %s", email, str(e)[:200])
 
+    log_kiosk.debug(
+        "session_fetch done email=%s total=%.0fms",
+        email, (time.time() - t0) * 1000,
+    )
     return result
 
 
@@ -555,17 +715,36 @@ def get_kiosk_states(emails_tuple):
     """
     emails = [e for e in emails_tuple if e]
     if not emails:
+        log_kiosk.debug("get_kiosk_states: empty email list")
         return {}
 
+    log_kiosk.info(
+        "batch start: polling %d email(s): %s",
+        len(emails), ', '.join(emails)
+    )
+    t0 = time.time()
+
     result = {}
+    success_count = 0
     with ThreadPoolExecutor(max_workers=KIOSK_WORKERS) as pool:
         futures = {pool.submit(_fetch_kiosk_state, e): e for e in emails}
         for f in as_completed(futures):
             email = futures[f]
             try:
-                result[email] = f.result() or {}
-            except Exception:
+                r = f.result() or {}
+                result[email] = r
+                if r:
+                    success_count += 1
+            except Exception as e:
                 result[email] = {}
+                log_kiosk.error(
+                    "batch worker EXC email=%s: %s", email, str(e)[:200]
+                )
+
+    log_kiosk.info(
+        "batch done: %d/%d successful in %.0fms",
+        success_count, len(emails), (time.time() - t0) * 1000,
+    )
     return result
 
 
@@ -832,81 +1011,102 @@ def find_punch(user_punches, shift_info, t_date, _cache=None):
 
 def needs_kiosk_poll(shift_info, punch, now):
     """
-    Decide whether we actually need a fresh kiosk-state fetch for this shift
-    right now. The goal is to skip unnecessary API calls for shifts whose
-    status is already settled (Completed, No Show, etc.).
+    Decide whether a given shift needs a fresh kiosk-state fetch right now.
 
-    Polling windows (relative to shift start/end):
+    Polling strategy: CONTINUOUS during the shift's active window. A prior
+    version had two separate windows (clock-in watch + clock-out watch) with
+    a "dead zone" gap in between, which caused shifts to incorrectly flip to
+    No Show between start+30min and end-10min when the kiosk state cache
+    expired during that gap.
 
-      CLOCK-IN TRACKING
-      • [start - 10m, start + 30m]  → watching for the clock-in to appear.
-        After +30m with no clock-in, we lock in "No Show" permanently.
-
-      CLOCK-OUT TRACKING
-      • [end - 10m, end + 30m]      → watching for the clock-out.
-        If still clocked in at end + 30m, we lock in "Missing Clock-Out".
-      • Single extra check at end + 90m → final chance to catch a late
-        clock-out before we mark "Did Not Clock Out" permanently.
-
-    Anything outside these windows returns False — status is stable.
+    Windows:
+      • [start - 10m, end + 30m]   — continuous live polling for the whole
+        expected presence window. Covers clock-in watch, shift in progress,
+        and clock-out watch as one unbroken range.
+      • [end + 85m, end + 95m]     — final late-clock-out check for anyone
+        whose endTimestamp never arrived.
     """
     start, end = shift_info['start'], shift_info['end']
 
-    # If we already have a complete punch record (cin + cout), no polling needed
+    # Complete punch records — no polling needed
     if punch:
         cin_raw = punch.get('startTimestamp')
         cout_raw = punch.get('endTimestamp')
-        # Manager-fix (both null): finalized
         if not cin_raw and not cout_raw:
-            return False
-        # Both present: finalized
+            return False  # manager-fix, finalized
         if cin_raw and cout_raw:
-            return False
-        # cin but no cout: fall through — may still clock out
+            return False  # cin + cout both present, finalized
+        # cin only: fall through — keep polling through end+30 to catch cout
 
-    # Clock-in window: up to +30 min after start
-    if start - timedelta(minutes=10) <= now <= start + timedelta(minutes=30):
-        # If we don't have a clock-in yet, keep polling
-        has_cin = punch and punch.get('startTimestamp')
-        if not has_cin:
-            return True
-
-    # Clock-out window: end - 10m to end + 30m
-    if end - timedelta(minutes=10) <= now <= end + timedelta(minutes=30):
-        # Only care about clock-out if we don't already have one
-        if punch:
-            cout_raw = punch.get('endTimestamp')
-            if not cout_raw:
-                return True
-        else:
-            # No punch record visible yet — might be a live clock-in still in progress
-            return True
+    # Primary continuous window — from 10 min before start through 30 min
+    # after end. No gap. If the shift is active right now (or just about to
+    # be, or just wrapped up), we want live data.
+    if start - timedelta(minutes=10) <= now <= end + timedelta(minutes=30):
+        return True
 
     # Final clock-out check at end + 90m (±5 min window so the Streamlit
-    # refresh cadence reliably catches it)
+    # refresh cadence reliably catches it). Only if we still don't have
+    # endTimestamp on record.
     if end + timedelta(minutes=85) <= now <= end + timedelta(minutes=95):
-        if punch:
-            cout_raw = punch.get('endTimestamp')
-            if not cout_raw:
-                return True
+        if not punch or not punch.get('endTimestamp'):
+            return True
 
     return False
 
 
 def classify(shift_info, punch, now, kiosk_state=None):
     """
+    Public wrapper around _classify_raw that logs each classification.
+    See _classify_raw for the full decision tree.
+    """
+    status, css, cin, cout = _classify_raw(shift_info, punch, now, kiosk_state)
+
+    # Summarize inputs briefly for the log line
+    punch_desc = 'none'
+    if punch:
+        p_cin = punch.get('startTimestamp')
+        p_cout = punch.get('endTimestamp')
+        p_sid = punch.get('eventShiftId')
+        punch_desc = f"cin={p_cin} cout={p_cout} shiftId={p_sid}"
+
+    kiosk_desc = 'none'
+    if kiosk_state:
+        kiosk_desc = (
+            f"is_signed_in={kiosk_state.get('is_signed_in')} "
+            f"checkin_date={kiosk_state.get('checkin_date')}"
+        )
+
+    log_match.debug(
+        "classify uid=%s name=%s shift=%s..%s → %s | punch=%s | kiosk=%s",
+        shift_info.get('uid'),
+        f"{shift_info.get('fname','')} {shift_info.get('lname','')}".strip(),
+        shift_info['start'].strftime('%H:%M'),
+        shift_info['end'].strftime('%H:%M'),
+        status,
+        punch_desc,
+        kiosk_desc,
+    )
+    return status, css, cin, cout
+
+
+def _classify_raw(shift_info, punch, now, kiosk_state=None):
+    """
     Determine shift status. Uses these sources in priority order:
 
-    1. Completed punch record (clock-in + clock-out) → Completed
+    1. Completed punch record (cin + cout) → Completed
     2. Manager-fix record (both timestamps null) → Completed (Fixed)
     3. Clock-in-only punch + kiosk says is_signed_in → On Shift
-    4. Clock-in-only punch + we're past end + 90m → Did Not Clock Out (final)
-    5. Clock-in-only punch + we're past end + 30m → Missing Clock-Out
-    6. Clock-in-only punch + still within shift window → On Shift
-    7. Kiosk says is_signed_in (no punch yet) → On Shift (live)
-    8. Past shift start by 30m+, no evidence → No Show (final)
-    9. Past shift start, no clock-in → Late
-    10. Future / in-window → Scheduled / Starting Soon / In Progress
+    4. Clock-in-only punch + past end + 90m → Did Not Clock Out (final)
+    5. Clock-in-only punch + past end + 30m → Missing Clock-Out
+    6. Clock-in-only punch within shift window → On Shift
+    7. No punch + kiosk is_signed_in=True (today) → On Shift (live)
+    8. No punch + kiosk is_signed_in=False, but checkin_date is today
+       and falls in this shift's window → Completed (pending serviceTime
+       sync — handles the gap between someone clocking out on the kiosk
+       and Bloomerang's serviceTime API reflecting that with a full record)
+    9. Past shift start by 30m+, no evidence → No Show (final)
+    10. Past shift start, no clock-in visible → Late
+    11. Future / in-window → Scheduled / Starting Soon / In Progress
 
     Returns (status_label, css_class, clock_in_dt, clock_out_dt).
     """
@@ -937,26 +1137,67 @@ def classify(shift_info, punch, now, kiosk_state=None):
                 return 'Missing Clock-Out', 'status-alert-amber', cin, None
             return 'On Shift', 'status-checked-in', cin, None
 
-    # No punch record — but kiosk may say they're currently clocked in.
-    # Happens during a shift that's in progress before serviceTime has synced.
-    if kiosk_state and kiosk_state.get('is_signed_in'):
-        cin = _parse_bloomerang_ts(kiosk_state.get('checkin_date'))
-        if cin and start - timedelta(hours=1) <= cin <= end + timedelta(hours=1):
-            return 'On Shift', 'status-checked-in', cin, None
+    # ── No punch record — fall back to live kiosk state ──────────────────
+    # Important cases to handle here:
+    #
+    #  A. is_signed_in=True AND we're well within shift window or just past
+    #     end → they are currently clocked in, show On Shift live. Don't
+    #     bound too narrowly: a volunteer can legitimately clock in more
+    #     than an hour before their shift (e.g. they arrived early for dog
+    #     walking and were already clocked in when their 2 PM shift began).
+    #
+    #  A'. is_signed_in=True BUT we're 30m+ past shift end → they clocked
+    #     in but never clocked out. Show Missing Clock-Out / Did Not Clock
+    #     Out based on how far past we are. Same thresholds as when we
+    #     have a punch record with cin-only.
+    #
+    #  B. is_signed_in=False AND checkin_date is from today AND matches
+    #     THIS shift's window → they clocked in AND out for this shift,
+    #     but the serviceTime API hasn't written the record yet (there's
+    #     observable lag — many minutes). Show as Completed with just the
+    #     clock-in time so we don't falsely flip to No Show during the
+    #     sync gap.
+    if kiosk_state:
+        is_in = kiosk_state.get('is_signed_in')
+        kiosk_cin = _parse_bloomerang_ts(kiosk_state.get('checkin_date'))
+        kiosk_cin_is_today = bool(kiosk_cin and kiosk_cin.date() == now.date())
+        # Is the live check-in plausibly for THIS shift (roughly within
+        # window)? Used to avoid attributing a morning clock-in that's
+        # still active to an unrelated afternoon shift.
+        kiosk_cin_near_shift = bool(
+            kiosk_cin and
+            start - timedelta(hours=2) <= kiosk_cin <= end + timedelta(minutes=30)
+        )
 
-    # No evidence of attendance
+        # Case A / A': currently signed in
+        if is_in and kiosk_cin_is_today and kiosk_cin_near_shift:
+            # Past end + 90m and still signed in → definitely didn't clock out
+            if now > end + timedelta(minutes=90):
+                return 'Did Not Clock Out', 'status-alert-amber', kiosk_cin, None
+            # Past end + 30m → starting to worry about clock-out
+            if now > end + timedelta(minutes=LATE_OUT_MINUTES):
+                return 'Missing Clock-Out', 'status-alert-amber', kiosk_cin, None
+            # Within normal shift envelope → On Shift
+            return 'On Shift', 'status-checked-in', kiosk_cin, None
+
+        # Case B: signed out, last check-in was today, and falls within
+        # this shift's window. Completed-pending-sync.
+        if (not is_in and kiosk_cin_is_today
+                and start - timedelta(minutes=30) <= kiosk_cin <= end + timedelta(minutes=30)
+                and now >= start):
+            return 'Completed', 'status-completed', kiosk_cin, None
+
+    # ── No evidence of attendance ─────────────────────────────────────────
     if now < start - timedelta(minutes=UPCOMING_MINUTES):
         return 'Scheduled', 'status-pending', None, None
     if now < start:
         return 'Starting Soon', 'status-upcoming', None, None
-    # Shift has started but no clock-in visible
+    # Shift has started but nothing visible
     if now <= start + timedelta(minutes=10):
         # Grace period — they may just be clocking in right now
         return 'In Progress', 'status-in-progress', None, None
     if now <= start + timedelta(minutes=30):
-        # Past grace but within late window
         return 'Late', 'status-alert-amber', None, None
-    # Past late window → No Show (permanent)
     return 'No Show', 'status-alert-red', None, None
 
 
@@ -1246,6 +1487,10 @@ else:
         _probe_email = (st.session_state.get('credentials') or {}).get('email')
         kiosk_status = kiosk_probe_status(_probe_email)
         kiosk_available = kiosk_status['reachable']
+        log_kiosk.info(
+            "probe result: reachable=%s reason=%s",
+            kiosk_available, kiosk_status.get('reason'),
+        )
 
     # Group roster by date first — we need allocations before deciding who to poll
     by_date = {}
@@ -1270,6 +1515,7 @@ else:
     if today_in_range and kiosk_available:
         today_shifts = by_date.get(now.date(), [])
         emails_to_poll = set()
+        shifts_in_window = 0
         for v in today_shifts:
             if not v.get('email'):
                 continue
@@ -1277,11 +1523,19 @@ else:
             punch_for_shift = alloc.get(str(v['sid']))
             if needs_kiosk_poll(v, punch_for_shift, now):
                 emails_to_poll.add(v['email'])
+                shifts_in_window += 1
+
+        log_kiosk.info(
+            "poll decision: %d shift(s) in active window → %d unique email(s) to poll",
+            shifts_in_window, len(emails_to_poll),
+        )
 
         if emails_to_poll:
             with st.spinner("Checking live clock-in state..."):
                 kiosk_states_by_email = get_kiosk_states(
                     tuple(sorted(emails_to_poll)))
+        else:
+            log_kiosk.debug("no shifts need polling right now — skipping batch")
 
     # Render each date section
     for section_idx, date_key in enumerate(sorted(by_date.keys())):
@@ -1348,6 +1602,39 @@ else:
             with cols[idx % 4]:
                 st.markdown(render_card(card, debug=st.session_state.get('debug_mode', False)),
                             unsafe_allow_html=True)
+
+# ─── Debug Log panel ──────────────────────────────────────────────────────────
+# Collapsible at the bottom of the board. Shows the last ~1000 log lines
+# from this Streamlit session. Download button lets you save a snapshot
+# for sharing/debugging.
+buf = st.session_state.get('log_buffer')
+if buf is not None:
+    st.divider()
+    with st.expander(f"🔬 Debug Log ({len(buf)} lines)", expanded=False):
+        if not buf:
+            st.caption("No log entries yet.")
+        else:
+            log_text = '\n'.join(buf)
+            # Newest-first so you see recent activity without scrolling
+            reversed_text = '\n'.join(reversed(list(buf)))
+            c1, c2 = st.columns([1, 4])
+            with c1:
+                st.download_button(
+                    "⬇️ Download log.txt",
+                    data=log_text,
+                    file_name=f"refugeboard-{datetime.now(LOCAL_TZ).strftime('%Y%m%d-%H%M%S')}.log",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+                if st.button("🗑 Clear", use_container_width=True):
+                    buf.clear()
+                    st.rerun()
+            with c2:
+                st.caption(
+                    f"Showing most recent first. Buffer capped at "
+                    f"{LOG_BUFFER_SIZE} lines."
+                )
+            st.code(reversed_text, language='log')
 
 # ─── Auto-refresh ─────────────────────────────────────────────────────────────
 time.sleep(REFRESH_SECS)
