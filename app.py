@@ -329,9 +329,12 @@ def authenticate_headless(email, password):
         """)
 
         log_auth.info(
-            "authenticate_headless OK: got %d cookies, token %s in %.0fms",
-            len(sess.cookies), 'present' if token else 'MISSING',
+            "authenticate_headless OK: got %d cookies in %.0fms "
+            "(token %s — volunteer portal authenticates via cookies, "
+            "so the absent token is expected)",
+            len(sess.cookies),
             (time.time() - t0) * 1000,
+            'present' if token else 'absent',
         )
         return {"sess": sess, "token": token}
     except Exception as e:
@@ -756,12 +759,20 @@ def build_roster(shifts_raw, target_dates):
 
     roster = []
     uids = set()
+    # Dedup key MUST include the date. Bloomerang reuses the same shift id
+    # (sid) across multiple days when the shift is part of a recurring series
+    # — so dedup'ing only on (sid, uid) collapses "John at 2 PM Friday" and
+    # "John at 2 PM Saturday" into a single entry, attributed to whichever
+    # we saw first. Including the date separates them correctly.
     seen = set()
+    dup_count = 0
+    skipped_no_date = 0
 
     for shift in shifts_raw:
         s_start = _parse_bloomerang_ts(shift.get('startDate'))
         s_end = _parse_bloomerang_ts(shift.get('endDate'))
         if s_start is None or s_end is None:
+            skipped_no_date += 1
             continue
 
         if s_start.date() not in target_dates:
@@ -778,8 +789,13 @@ def build_roster(shifts_raw, target_dates):
                 uid = user.get('id')
                 if not uid:
                     continue
-                key = (sid, uid)
+                # Include the start datetime (to the minute) in the dedup key.
+                # Two legitimate shifts for the same user always differ in
+                # start time; two duplicate records for the same shift have
+                # an identical start.
+                key = (sid, uid, s_start.isoformat())
                 if key in seen:
+                    dup_count += 1
                     continue
                 seen.add(key)
 
@@ -805,6 +821,12 @@ def build_roster(shifts_raw, target_dates):
                 })
                 uids.add(uid)
 
+    log_api.info(
+        "build_roster: %d entries from %d raw shifts (%d dup records skipped, "
+        "%d unparseable dates); target_dates=%s",
+        len(roster), len(shifts_raw), dup_count, skipped_no_date,
+        sorted(str(d) for d in target_dates),
+    )
     return roster, list(uids)
 
 
@@ -1077,9 +1099,11 @@ def classify(shift_info, punch, now, kiosk_state=None):
         )
 
     log_match.debug(
-        "classify uid=%s name=%s shift=%s..%s → %s | punch=%s | kiosk=%s",
+        "classify uid=%s sid=%s name=%s date=%s shift=%s..%s → %s | punch=%s | kiosk=%s",
         shift_info.get('uid'),
+        shift_info.get('sid'),
         f"{shift_info.get('fname','')} {shift_info.get('lname','')}".strip(),
+        shift_info['start'].strftime('%Y-%m-%d'),
         shift_info['start'].strftime('%H:%M'),
         shift_info['end'].strftime('%H:%M'),
         status,
