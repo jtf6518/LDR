@@ -28,7 +28,7 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 # Cache TTLs — tuned to minimize API load while keeping the board fresh
 SHIFT_CACHE_TTL = 300     # shifts rarely change → 5 min
-SERVICE_CACHE_TTL = 120    # clock-ins/outs surface here → 1 min
+SERVICE_CACHE_TTL = 60    # clock-ins/outs surface here → 1 min
 REFRESH_SECS = 120        # auto-rerun interval (UI refresh)
 
 # Status thresholds
@@ -203,7 +203,7 @@ st.markdown("""
     }
     .status-alert-amber .status-badge { background: #f59e0b; color: #1a0f00; }
 
-    /* No Show — red (only after shift is over) */
+    /* No Clock-In — red (only after shift is over) */
     .status-alert-red {
         background: linear-gradient(135deg, #3d1a1a 0%, #5d2626 100%);
         border-left-color: #ef4444;
@@ -975,40 +975,58 @@ def assign_punches(user_shifts, user_punches, t_date):
                     assigned[key] = c['punch']
                     shift_id_matched.add(id(c['punch']))
 
-    # Step 3 — coverage pass: one session covers multiple consecutive shifts
-    # when its time range overlaps the shift's time range. A "session" is
-    # (cin, cout). For each candidate with a real time range, find every
-    # unclaimed shift whose window overlaps, and claim them.
+    # Step 3 — overlap-scored coverage. For each (punch, shift) pair, compute
+    # the actual minutes of interval overlap. A punch's session is treated as
+    # [cin, cout] (or [cin, cin + 2h] if still open). Pairs are ranked by
+    # overlap descending, and we walk that list claiming each unclaimed shift
+    # in order. A long single session that genuinely overlaps multiple
+    # consecutive shifts can still claim all of them (volunteer who clocks in
+    # at 2 PM, works 2 hours, clocks out at 4 PM gets the same punch on both
+    # the 14-15 and 15-16 shifts because both have 60 min overlap).
     #
-    # "Overlap" here is generous: cin must be within 30 min before shift_end
-    # AND cout (if present) must be within 30 min after shift_start. In plain
-    # English: the clock-in happened before or during the shift, and the
-    # clock-out (if any) happened during or after.
+    # The previous implementation used bilateral 30-minute grace windows
+    # (cin ≤ shift_end+30 AND cout ≥ shift_start-30). That over-claimed
+    # boundary cases: a punch ending exactly at 15:00 was credited to the
+    # 15:00-16:00 shift even with zero actual overlap, because cout(15:00) ≥
+    # start(15:00) − 30m. With this version a punch must actually overlap
+    # the shift's interval by at least MIN_OVERLAP_MINUTES.
+    MIN_OVERLAP_MINUTES = 15
+    OPEN_SESSION_DEFAULT = timedelta(minutes=120)
+
+    def _overlap_minutes(c, s):
+        cin = c['start']
+        if cin is None:
+            return 0
+        session_end = c['end'] if c['end'] else cin + OPEN_SESSION_DEFAULT
+        ov_start = max(cin, s['start'])
+        ov_end = min(session_end, s['end'])
+        if ov_end <= ov_start:
+            return 0
+        return (ov_end - ov_start).total_seconds() / 60
+
+    overlap_scored = []
     for c in candidates:
         if c['start'] is None:
-            continue  # manually entered, no time range
-        cin = c['start']
-        cout = c['end']  # may be None if still clocked in
-
-        # How late-start are we willing to forgive? 30 min of grace.
-        latest_valid_cin = lambda s: s['end'] + timedelta(minutes=30)
-        # How early-finish are we willing to forgive? If cout is before the
-        # shift even started by more than 30 min, it didn't cover the shift.
-        earliest_valid_cout = lambda s: s['start'] - timedelta(minutes=30)
-
+            continue  # manually entered punch — handled by step 4
         for s in user_shifts:
             sid_key = str(s['sid'])
             if sid_key in assigned:
-                continue  # already claimed
+                continue  # step 2 already claimed it via exact id
+            ov = _overlap_minutes(c, s)
+            if ov >= MIN_OVERLAP_MINUTES:
+                overlap_scored.append((ov, c, s))
 
-            # Did this session cover this shift?
-            if cin > latest_valid_cin(s):
-                continue  # clocked in too late (after shift was already over + 30min)
-            if cout is not None and cout < earliest_valid_cout(s):
-                continue  # clocked out before shift began (+30min grace)
+    # Best fits first — ties broken by candidate order, which is fine.
+    overlap_scored.sort(key=lambda t: -t[0])
 
-            # Session covers the shift.
-            assigned[sid_key] = c['punch']
+    for ov, c, s in overlap_scored:
+        sid_key = str(s['sid'])
+        if sid_key in assigned:
+            continue
+        # Punches CAN be reused across shifts when one session genuinely
+        # spans both — that's the whole point of step 3. Don't deduplicate
+        # by punch id here.
+        assigned[sid_key] = c['punch']
 
     # Step 4 — proximity fallback for any still-unclaimed shifts and any
     # remaining punches that weren't used in coverage (e.g., because they
@@ -1060,71 +1078,60 @@ def needs_kiosk_poll(shift_info, punch, now, last_kiosk_state=None):
     """
     Decide whether a given shift needs a fresh kiosk-state fetch right now.
 
-    Polling strategy: CONTINUOUS during the shift's active window, plus
-    extended polling while we have an unresolved live-state observation
-    (seen someone On Shift but haven't yet seen the serviceTime punch).
+    Strategy: poll the kiosk for any of TODAY's shifts that don't yet have a
+    complete punch record and have started (or are about to start). No upper
+    time bound — if a volunteer clocked in this morning and never clocked out,
+    we keep asking the kiosk all day, because the kiosk is the persistent
+    source of truth (not Streamlit's ephemeral session_state).
 
-    Windows:
-      • [start - 10m, end + 30m]   — primary continuous window
-      • while last_kiosk_state shows is_signed_in=True (no punch yet) → keep
-        polling right up until end + 180m. Avoids the bug where a volunteer
-        was correctly shown On Shift during the shift but the dashboard
-        stopped polling at end+30m while serviceTime hadn't synced the cout
-        yet — resulting in a cold "No Show" at end+60m on page reload.
-      • [end + 85m, end + 95m]     — final late-clock-out check for anyone
-        whose endTimestamp never arrived (belt-and-suspenders).
+    Why no upper bound:
+      • Bloomerang's kiosk holds is_signed_in=True until the volunteer clocks
+        out, regardless of how much time has passed. A 9 AM clock-in with no
+        clock-out still reads is_signed_in=True at 5 PM.
+      • Earlier versions cut polling at end+30m or end+180m. After a session
+        restart we'd lose the in-memory state and never re-poll, leaving the
+        card as "No Clock-In" even though the kiosk still knew the volunteer
+        was signed in. This was the Adriana / Amaia regression on 2026-04-25.
+      • Polling cost is bounded — kiosk responses are 30s-cached and
+        fan out across 8 workers.
+
+    Skip cases:
+      • Punch has both timestamps (complete) — nothing to learn from kiosk.
+      • Punch is a manager-fix entry (both timestamps null) — finalized hours.
+      • Shift is on a different day from today — kiosk only carries today's
+        signed-in state meaningfully.
+      • Shift hasn't started yet (more than 10 min in the future) — no
+        clock-in expected; saving a request.
+
+    last_kiosk_state is no longer consulted by this function (the kiosk
+    endpoint is queried directly), but the parameter is kept for backward
+    compatibility with the call site. Removing the parameter would touch
+    both build sites and is unnecessary.
     """
     start, end = shift_info['start'], shift_info['end']
 
-    # Complete punch records — no polling needed
+    # Complete punch records → no polling needed
     if punch:
         cin_raw = punch.get('startTimestamp')
         cout_raw = punch.get('endTimestamp')
         if not cin_raw and not cout_raw:
-            return False  # manager-fix, finalized
+            return False  # manager-fix entry, finalized
         if cin_raw and cout_raw:
-            return False  # cin + cout both present, finalized
-        # cin only: fall through — keep polling through end+30 to catch cout
+            return False  # both timestamps present, finalized
+        # cin-only: fall through, keep polling for either a cout or
+        # confirmation that the volunteer never clocked out.
 
-    # Primary continuous window — from 10 min before start through 30 min
-    # after end. No gap. If the shift is active right now (or just about to
-    # be, or just wrapped up), we want live data.
-    if start - timedelta(minutes=10) <= now <= end + timedelta(minutes=30):
-        return True
+    # Only today's shifts make sense to poll — the kiosk endpoint reflects
+    # current signed-in state, not historical.
+    if start.date() != now.date():
+        return False
 
-    # Extended window — two unresolved live-state scenarios; both keep
-    # polling until end+180m so classify() always has live evidence.
-    #
-    # Case A: still signed in (is_signed_in=True, no cout punch)
-    #   → keep polling so we can detect eventual clock-out or confirm
-    #     "Did Not Clock Out" at the hard cutoff.
-    #
-    # Case B: signed out today (is_signed_in=False, checkin_date is today
-    #   and falls within this shift's window) but no serviceTime record yet.
-    #   Without continued polling, kiosk_state becomes None after the 15-min
-    #   fallback window expires and the card flips to "No Show" even though
-    #   the volunteer attended. Poll until end+180m to bridge the serviceTime
-    #   sync lag (observed up to ~2.5 hours in production).
-    if last_kiosk_state and now <= end + timedelta(minutes=180):
-        is_in = last_kiosk_state.get('is_signed_in')
-        if is_in:
-            # Still on site — keep watching for clock-out or Did Not Clock Out
-            return True
-        # Clocked out today and near this shift — pending sync
-        last_cin = _parse_bloomerang_ts(last_kiosk_state.get('checkin_date'))
-        if (last_cin
-                and last_cin.date() == now.date()
-                and start - timedelta(hours=2) <= last_cin <= end + timedelta(minutes=30)):
-            return True
+    # Future shifts more than 10 min out: don't bother yet.
+    if now < start - timedelta(minutes=10):
+        return False
 
-    # Final clock-out check at end + 90m (±5 min window so the Streamlit
-    # refresh cadence reliably catches it). Only if we still don't have
-    # endTimestamp on record.
-    if end + timedelta(minutes=85) <= now <= end + timedelta(minutes=95):
-        if not punch or not punch.get('endTimestamp'):
-            return True
-
-    return False
+    # Today's shift, has started (or imminent), no complete punch: poll.
+    return True
 
 
 def classify(shift_info, punch, now, kiosk_state=None):
@@ -1171,7 +1178,7 @@ def _classify_raw(shift_info, punch, now, kiosk_state=None):
     1. Completed punch record (cin + cout) → Completed
     2. Manager-fix record (both timestamps null) → Completed (Fixed)
     3. Clock-in-only punch + kiosk says is_signed_in → On Shift
-    4. Clock-in-only punch + past end + 90m → Did Not Clock Out (final)
+    4. Clock-in-only punch + past end + 90m → No Clock-Out (final)
     5. Clock-in-only punch + past end + 30m → Missing Clock-Out
     6. Clock-in-only punch within shift window → On Shift
     7. No punch + kiosk is_signed_in=True (today) → On Shift (live)
@@ -1179,7 +1186,7 @@ def _classify_raw(shift_info, punch, now, kiosk_state=None):
        and falls in this shift's window → Completed (pending serviceTime
        sync — handles the gap between someone clocking out on the kiosk
        and Bloomerang's serviceTime API reflecting that with a full record)
-    9. Past shift start by 30m+, no evidence → No Show (final)
+    9. Past shift start by 30m+, no evidence → No Clock-In (final)
     10. Past shift start, no clock-in visible → Late
     11. Future / in-window → Scheduled / Starting Soon / In Progress
 
@@ -1207,7 +1214,7 @@ def _classify_raw(shift_info, punch, now, kiosk_state=None):
                 return 'On Shift', 'status-checked-in', cin, None
             # Final lock-in: 90+ min past end with no clock-out = definitely failed to clock out
             if now > end + timedelta(minutes=90):
-                return 'Did Not Clock Out', 'status-alert-amber', cin, None
+                return 'No Clock-Out', 'status-alert-amber', cin, None
             if now > end + timedelta(minutes=LATE_OUT_MINUTES):
                 return 'Missing Clock-Out', 'status-alert-amber', cin, None
             return 'On Shift', 'status-checked-in', cin, None
@@ -1236,24 +1243,35 @@ def _classify_raw(shift_info, punch, now, kiosk_state=None):
         is_in = kiosk_state.get('is_signed_in')
         kiosk_cin = _parse_bloomerang_ts(kiosk_state.get('checkin_date'))
         kiosk_cin_is_today = bool(kiosk_cin and kiosk_cin.date() == now.date())
-        # Is the live check-in plausibly for THIS shift (roughly within
-        # window)? Used to avoid attributing a morning clock-in that's
-        # still active to an unrelated afternoon shift.
+        # Is the live check-in plausibly for THIS shift? Lower bound is
+        # generous (start - 2h) because volunteers often clock in early for
+        # back-to-back shifts. Upper bound is the shift end exactly — a
+        # clock-in AFTER the shift ended cannot belong to that shift; it
+        # belongs to a later one. Without this tightening, a back-to-back
+        # volunteer who clocks out at 3:00 PM and immediately clocks in for
+        # the 3-4 PM shift would have their 15:01 cin credited to the
+        # 14-15 shift (would show as On Shift for an already-ended shift).
         kiosk_cin_near_shift = bool(
             kiosk_cin and
-            start - timedelta(hours=2) <= kiosk_cin <= end + timedelta(minutes=30)
+            start - timedelta(hours=2) <= kiosk_cin <= end
         )
 
         # Case A / A': currently signed in
         if is_in and kiosk_cin_is_today and kiosk_cin_near_shift:
-            # Past end + 90m and still signed in → definitely didn't clock out
-            if now > end + timedelta(minutes=90):
-                return 'Did Not Clock Out', 'status-alert-amber', kiosk_cin, None
-            # Past end + 30m → starting to worry about clock-out
-            if now > end + timedelta(minutes=LATE_OUT_MINUTES):
-                return 'Missing Clock-Out', 'status-alert-amber', kiosk_cin, None
-            # Within normal shift envelope → On Shift
-            return 'On Shift', 'status-checked-in', kiosk_cin, None
+            # Guard: if the shift hasn't started yet (beyond the 10-min early-
+            # arrival grace), don't show On Shift. This prevents a volunteer
+            # who clocked in for an earlier shift from showing On Shift on a
+            # later back-to-back shift before it actually begins. Fall through
+            # to Starting Soon / Scheduled in the no-evidence block below.
+            if now >= start - timedelta(minutes=10):
+                # Past end + 90m and still signed in → definitely didn't clock out
+                if now > end + timedelta(minutes=90):
+                    return 'No Clock-Out', 'status-alert-amber', kiosk_cin, None
+                # Past end + 30m → starting to worry about clock-out
+                if now > end + timedelta(minutes=LATE_OUT_MINUTES):
+                    return 'Missing Clock-Out', 'status-alert-amber', kiosk_cin, None
+                # Within normal shift envelope → On Shift
+                return 'On Shift', 'status-checked-in', kiosk_cin, None
 
         # Case B: signed out, last check-in was today, and falls within
         # this shift's window. Completed-pending-sync.
@@ -1273,7 +1291,7 @@ def _classify_raw(shift_info, punch, now, kiosk_state=None):
         return 'In Progress', 'status-in-progress', None, None
     if now <= start + timedelta(minutes=30):
         return 'Late', 'status-alert-amber', None, None
-    return 'No Show', 'status-alert-red', None, None
+    return 'No Clock-In', 'status-alert-red', None, None
 
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
@@ -1291,8 +1309,8 @@ def render_meta_bar(counts, total, sync_time=None, kiosk_status=None, show_kiosk
     sched = counts.get('Scheduled', 0)
     late = counts.get('Late', 0)
     miss = counts.get('Missing Clock-Out', 0)
-    dnc = counts.get('Did Not Clock Out', 0)
-    ns = counts.get('No Show', 0)
+    dnc = counts.get('No Clock-Out', 0)
+    ns = counts.get('No Clock-In', 0)
     alerts = late + miss + dnc + ns
 
     parts = [f'<div class="stat"><b>{total}</b> shifts</div>']
@@ -1643,7 +1661,7 @@ else:
                 del last_state_store[_k]
 
         # Attendance floor store — once we have confirmed a volunteer was
-        # present (On Shift, Missing Clock-Out, Did Not Clock Out, or
+        # present (On Shift, Missing Clock-Out, No Clock-Out, or
         # Completed via kiosk), we record the best status we've ever seen
         # for this shift-occurrence. classify() may later return "No Show"
         # if kiosk becomes unavailable and serviceTime hasn't synced yet,
@@ -1663,7 +1681,7 @@ else:
             'On Shift': 1,
             'Missing Clock-Out': 2,
             'Completed': 3,
-            'Did Not Clock Out': 3,
+            'No Clock-Out': 3,
             'Completed (Fixed)': 4,
         }
 
