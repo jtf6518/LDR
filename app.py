@@ -28,7 +28,7 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 # Cache TTLs — tuned to minimize API load while keeping the board fresh
 SHIFT_CACHE_TTL = 300     # shifts rarely change → 5 min
-SERVICE_CACHE_TTL = 60    # clock-ins/outs surface here → 1 min
+SERVICE_CACHE_TTL = 120    # clock-ins/outs surface here → 1 min
 REFRESH_SECS = 120        # auto-rerun interval (UI refresh)
 
 # Status thresholds
@@ -458,9 +458,9 @@ def get_service_times(_auth, uids_tuple):
 # silently to the serviceTime-based matching and the dashboard still works.
 KIOSK_BASE = "https://kiosk.bloomerang.co"
 KIOSK_CACHE_TTL = 30          # is_signed_in changes in real time → refresh often
-KIOSK_TIMEOUT = 5             # cap per-volunteer request time
+KIOSK_TIMEOUT = 8             # cap per-volunteer request time (incl 1 retry)
 KIOSK_WORKERS = 8             # parallel fan-out
-KIOSK_PROBE_TIMEOUT = 4       # for initial reachability check
+KIOSK_PROBE_TIMEOUT = 6       # for initial reachability check
 
 
 # Browser-like headers for the kiosk endpoints — Bloomerang's API seems to
@@ -685,13 +685,38 @@ def _fetch_kiosk_state(email):
     event_user_account_id } — or None on failure.
 
     Uses the two-step session flow (kiosk login → currentevents) — see
-    _kiosk_session_fetch for why that's required.
+    _kiosk_session_fetch for why that's required. On timeout or network
+    error on the first attempt, retries once with a fresh session. A
+    bad kiosk response (timeout → None) used to downgrade volunteers
+    from "On Shift" to "Late" / "No Show"; retrying absorbs transient
+    server hiccups before they cascade into a wrong render.
     """
     if not email:
         return None
 
     fetch = _kiosk_session_fetch(email, timeout=KIOSK_TIMEOUT)
     data = fetch.get('events_data')
+
+    # Retry once on anything that looks transient — timeout, connection
+    # error, or a non-200 that isn't 401/403 (those are definitive).
+    if not isinstance(data, list):
+        err = fetch.get('error') or ''
+        login_sc = fetch.get('login_status')
+        events_sc = fetch.get('events_status')
+        transient = (
+            'timed out' in err or 'connection' in err or 'request error' in err
+            or (login_sc not in (200, 401, 403) and login_sc is not None)
+            or (events_sc is not None and events_sc >= 500)
+        )
+        if transient:
+            log_kiosk.warning(
+                "retrying kiosk fetch for email=%s after transient failure "
+                "(error=%s login=%s events=%s)",
+                email, err, login_sc, events_sc,
+            )
+            fetch = _kiosk_session_fetch(email, timeout=KIOSK_TIMEOUT)
+            data = fetch.get('events_data')
+
     if not isinstance(data, list):
         return None
 
@@ -1031,22 +1056,23 @@ def find_punch(user_punches, shift_info, t_date, _cache=None):
     return None  # overridden below — this function is now only called with pre-computed results
 
 
-def needs_kiosk_poll(shift_info, punch, now):
+def needs_kiosk_poll(shift_info, punch, now, last_kiosk_state=None):
     """
     Decide whether a given shift needs a fresh kiosk-state fetch right now.
 
-    Polling strategy: CONTINUOUS during the shift's active window. A prior
-    version had two separate windows (clock-in watch + clock-out watch) with
-    a "dead zone" gap in between, which caused shifts to incorrectly flip to
-    No Show between start+30min and end-10min when the kiosk state cache
-    expired during that gap.
+    Polling strategy: CONTINUOUS during the shift's active window, plus
+    extended polling while we have an unresolved live-state observation
+    (seen someone On Shift but haven't yet seen the serviceTime punch).
 
     Windows:
-      • [start - 10m, end + 30m]   — continuous live polling for the whole
-        expected presence window. Covers clock-in watch, shift in progress,
-        and clock-out watch as one unbroken range.
+      • [start - 10m, end + 30m]   — primary continuous window
+      • while last_kiosk_state shows is_signed_in=True (no punch yet) → keep
+        polling right up until end + 180m. Avoids the bug where a volunteer
+        was correctly shown On Shift during the shift but the dashboard
+        stopped polling at end+30m while serviceTime hadn't synced the cout
+        yet — resulting in a cold "No Show" at end+60m on page reload.
       • [end + 85m, end + 95m]     — final late-clock-out check for anyone
-        whose endTimestamp never arrived.
+        whose endTimestamp never arrived (belt-and-suspenders).
     """
     start, end = shift_info['start'], shift_info['end']
 
@@ -1065,6 +1091,31 @@ def needs_kiosk_poll(shift_info, punch, now):
     # be, or just wrapped up), we want live data.
     if start - timedelta(minutes=10) <= now <= end + timedelta(minutes=30):
         return True
+
+    # Extended window — two unresolved live-state scenarios; both keep
+    # polling until end+180m so classify() always has live evidence.
+    #
+    # Case A: still signed in (is_signed_in=True, no cout punch)
+    #   → keep polling so we can detect eventual clock-out or confirm
+    #     "Did Not Clock Out" at the hard cutoff.
+    #
+    # Case B: signed out today (is_signed_in=False, checkin_date is today
+    #   and falls within this shift's window) but no serviceTime record yet.
+    #   Without continued polling, kiosk_state becomes None after the 15-min
+    #   fallback window expires and the card flips to "No Show" even though
+    #   the volunteer attended. Poll until end+180m to bridge the serviceTime
+    #   sync lag (observed up to ~2.5 hours in production).
+    if last_kiosk_state and now <= end + timedelta(minutes=180):
+        is_in = last_kiosk_state.get('is_signed_in')
+        if is_in:
+            # Still on site — keep watching for clock-out or Did Not Clock Out
+            return True
+        # Clocked out today and near this shift — pending sync
+        last_cin = _parse_bloomerang_ts(last_kiosk_state.get('checkin_date'))
+        if (last_cin
+                and last_cin.date() == now.date()
+                and start - timedelta(hours=2) <= last_cin <= end + timedelta(minutes=30)):
+            return True
 
     # Final clock-out check at end + 90m (±5 min window so the Streamlit
     # refresh cadence reliably catches it). Only if we still don't have
@@ -1540,12 +1591,17 @@ else:
         today_shifts = by_date.get(now.date(), [])
         emails_to_poll = set()
         shifts_in_window = 0
+        # Grab the last-known-state store so needs_kiosk_poll can decide to
+        # keep polling beyond end+30m for shifts with unresolved live state.
+        _last_state_store = st.session_state.get('kiosk_last_state', {})
         for v in today_shifts:
             if not v.get('email'):
                 continue
             alloc = allocations_by_date[now.date()].get(v['uid'], {})
             punch_for_shift = alloc.get(str(v['sid']))
-            if needs_kiosk_poll(v, punch_for_shift, now):
+            state_key = (v['uid'], v['sid'], v['start'].date().isoformat())
+            last_known = _last_state_store.get(state_key)
+            if needs_kiosk_poll(v, punch_for_shift, now, last_known):
                 emails_to_poll.add(v['email'])
                 shifts_in_window += 1
 
@@ -1569,18 +1625,131 @@ else:
 
         cards = []
         counts = {}
+        # Last-known-kiosk-state store. Keyed by (uid, shift_sid, date_iso) so
+        # it's scoped per-shift-per-day. Lets us fall back to recent state
+        # when today's kiosk fetch returns None (timeout, rate limit, or the
+        # shift aged out of the polling window). Crucial for not downgrading
+        # a confirmed-present volunteer to "No Show" just because a single
+        # kiosk request hiccuped.
+        if 'kiosk_last_state' not in st.session_state:
+            st.session_state['kiosk_last_state'] = {}
+        last_state_store = st.session_state['kiosk_last_state']
+        # Garbage-collect entries older than 4 hours so the store stays
+        # bounded across a long-running browser session.
+        _gc_cutoff = now - timedelta(hours=4)
+        for _k in list(last_state_store.keys()):
+            _obs = last_state_store[_k].get('_observed_at')
+            if _obs and _obs < _gc_cutoff:
+                del last_state_store[_k]
+
+        # Attendance floor store — once we have confirmed a volunteer was
+        # present (On Shift, Missing Clock-Out, Did Not Clock Out, or
+        # Completed via kiosk), we record the best status we've ever seen
+        # for this shift-occurrence. classify() may later return "No Show"
+        # if kiosk becomes unavailable and serviceTime hasn't synced yet,
+        # but we override that with the floor so the card never regresses.
+        # Keyed identically to kiosk_last_state: (uid, sid, date_iso).
+        # GC matches: purge entries older than 4 hours.
+        if 'attendance_floor' not in st.session_state:
+            st.session_state['attendance_floor'] = {}
+        attendance_floor = st.session_state['attendance_floor']
+        for _k in list(attendance_floor.keys()):
+            _obs = attendance_floor[_k].get('_observed_at')
+            if _obs and _obs < _gc_cutoff:
+                del attendance_floor[_k]
+
+        # Priority order — higher index = more final / authoritative
+        _FLOOR_PRIORITY = {
+            'On Shift': 1,
+            'Missing Clock-Out': 2,
+            'Completed': 3,
+            'Did Not Clock Out': 3,
+            'Completed (Fixed)': 4,
+        }
+
         for v in shifts_for_date:
             alloc = allocation_by_uid.get(v['uid'], {})
             p = alloc.get(str(v['sid']))
 
-            # Pull kiosk state for this volunteer/event if available
+            # Compose the storage key for this specific shift-occurrence
+            state_key = (v['uid'], v['sid'], v['start'].date().isoformat())
+
+            # Pull fresh kiosk state for this volunteer/event if available
             kiosk_state = None
             if is_today and kiosk_available and v.get('email'):
                 per_event = kiosk_states_by_email.get(v['email'], {})
                 kiosk_state = per_event.get(EVENT_ID)
 
+            # If we got nothing fresh BUT we have a recently-stored state,
+            # fall back to it. A stored state from ≤15min ago is much more
+            # trustworthy than letting classify default to No Show.
+            fallback_used = False
+            if kiosk_state is None and is_today:
+                stored = last_state_store.get(state_key)
+                if stored:
+                    stored_at = stored.get('_observed_at')
+                    if stored_at and (now - stored_at) <= timedelta(minutes=15):
+                        kiosk_state = {k: v2 for k, v2 in stored.items()
+                                       if not k.startswith('_')}
+                        fallback_used = True
+                        log_match.debug(
+                            "kiosk fallback: using last-known for uid=%s "
+                            "name=%s age=%ds (is_signed_in=%s)",
+                            v['uid'],
+                            f"{v.get('fname','')} {v.get('lname','')}".strip(),
+                            int((now - stored_at).total_seconds()),
+                            kiosk_state.get('is_signed_in'),
+                        )
+
+            # Otherwise, store a fresh observation for future fallback
+            elif kiosk_state is not None:
+                stored_copy = dict(kiosk_state)
+                stored_copy['_observed_at'] = now
+                last_state_store[state_key] = stored_copy
+
             status, css, cin, cout = classify(v, p, now, kiosk_state)
             counts[status] = counts.get(status, 0) + 1
+
+            # Apply attendance floor — never downgrade a confirmed-present
+            # volunteer to No Show / Late / In Progress once we have evidence
+            # they attended. This guards against the window where polling has
+            # stopped (end+180m) or the kiosk is temporarily unreachable AND
+            # serviceTime hasn't synced the punch yet.
+            if is_today:
+                floor_entry = attendance_floor.get(state_key)
+                floor_status = floor_entry.get('status') if floor_entry else None
+                floor_priority = _FLOOR_PRIORITY.get(floor_status, 0)
+                current_priority = _FLOOR_PRIORITY.get(status, 0)
+
+                if floor_priority > current_priority and floor_status:
+                    # The floor outranks the current classification — hold position.
+                    # Restore the CSS class that went with the floor status.
+                    log_match.info(
+                        "floor override uid=%s sid=%s: %s → %s "
+                        "(kiosk=%s punch=%s)",
+                        v['uid'], v['sid'],
+                        status, floor_status,
+                        kiosk_state is not None,
+                        p is not None,
+                    )
+                    status = floor_status
+                    css = floor_entry.get('css', css)
+                    cin = floor_entry.get('cin', cin)
+                    cout = floor_entry.get('cout', cout)
+                elif current_priority > floor_priority:
+                    # Current classification is more certain than what we stored.
+                    # Elevate the floor.
+                    attendance_floor[state_key] = {
+                        'status': status,
+                        'css': css,
+                        'cin': cin,
+                        'cout': cout,
+                        '_observed_at': now,
+                    }
+                elif floor_entry:
+                    # Same priority — refresh the observation timestamp so GC
+                    # doesn't expire an active floor entry.
+                    attendance_floor[state_key]['_observed_at'] = now
 
             # Debug: list all today's eventShiftIds in this user's punches
             available_sids = []
@@ -1599,6 +1768,7 @@ else:
                 'available_sids': available_sids,
                 'matched_via_proximity': p is not None and p.get('eventShiftId') is None,
                 'kiosk_state': kiosk_state,
+                'kiosk_fallback': fallback_used,
             })
 
         cards.sort(key=lambda c: c['v']['start'])
